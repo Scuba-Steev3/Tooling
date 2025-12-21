@@ -137,7 +137,6 @@ cme_enum_users() {
     return 0
 }
 
-
 # --------- Ports ----------
 PORTS=(
     "21:FTP:interesting"
@@ -177,9 +176,48 @@ PORTS=(
     "27017:MongoDB:interesting"
     "54925:BROTHER_PRINTER:open"
 )
+
+# --------- CVE / Attack Surface Hints ----------
+declare -A CVE_HINTS=(
+  [21]="Anonymous FTP, writable dirs, legacy backdoors (CVE-2015-3306)"
+  [22]="Weak creds, outdated OpenSSH, user enumeration (CVE-2018-15473)"
+  [23]="Cleartext auth, legacy devices, credential reuse"
+  [25]="Open relay, user enumeration, Exim RCE (CVE-2019-10149)"
+  [53]="Zone transfer (AXFR), DNS recursion"
+  [80]="Web vulns: file upload, auth bypass, outdated CMS"
+  [88]="Kerberos roasting, AD misconfig, pre-auth disabled"
+  [110]="Cleartext POP3, weak creds"
+  [139]="SMB NULL session, EternalBlue class issues"
+  [389]="Anonymous LDAP bind, domain info disclosure"
+  [443]="TLS misconfig, weak ciphers, web vulns"
+  [445]="SMB relay, signing disabled, MS17-010"
+  [631]="CUPS info leak, printer RCE class issues"
+  [1433]="MSSQL auth abuse, xp_cmdshell exposure"
+  [2375]="Unauth Docker API → container escape risk"
+  [3000]="Dev panels, default creds, debug mode"
+  [3306]="Weak DB creds, data exposure"
+  [3389]="RDP brute-force, BlueKeep (CVE-2019-0708)"
+  [5985]="WinRM lateral movement, credential reuse"
+  [6379]="Unauth Redis → file write / RCE"
+  [6443]="K8s API anonymous access"
+  [8080]="Admin consoles, exposed dashboards"
+  [9100]="Raw printer protocol info disclosure"
+  [27017]="Unauth MongoDB data exposure"
+)
+
+print_cve_hint() {
+    local port="$1"
+    if [[ -n "${CVE_HINTS[$port]:-}" ]]; then
+        info "  - ${CVE_HINTS[$port]}"
+    fi
+}
+
 # --------- After port scanning completes ----------
 OPEN_PORTS=()   # Will store open ports
 
+# =========================================================
+# ================= SCRIPT START ==========================
+# =========================================================
 echo
 echo -e "${BLUE}========================================${RESET}"
 echo -e "${BLUE} Educational Recon Mode ${RESET}"
@@ -209,6 +247,7 @@ for ENTRY in "${PORTS[@]}"; do
 
     #echo -e "${COLOR}[+] Port $PORT OPEN ($SERVICE)${RESET}"
     success "Port $PORT OPEN ($SERVICE)"
+    
 
     case "$PORT" in
         80|8080|3000|5000) echo http >> "$HTTP_MARKER" ;;
@@ -314,7 +353,7 @@ for ENTRY in "${PORTS[@]}"; do
 
     if [ "$PORT" = "2375" ] && command -v curl >/dev/null; then
         curl -s "http://$TARGET:2375/containers/json" | grep -q '^\[' && \
-            echo -e "${RED}[!] Unauthenticated Docker API${RESET}"
+            echo -e "${RED}[!] Unauthenticated Docker API (CVE-2025-9074)${RESET}"
     fi
 ) &
 done
@@ -331,6 +370,11 @@ fi
 if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
     echo
     info "Open ports detected: ${OPEN_PORTS[*]}"
+    echo
+    info "CVE / Attack Surface Hints:"
+    for port in "${OPEN_PORTS[@]}"; do
+        print_cve_hint "$port"
+    done
 else
     warn "No open ports detected"
 fi

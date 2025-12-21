@@ -11,6 +11,42 @@
 # - Recon summary with next steps
 # ==============================
 
+###################### TODO #########################
+# Fix Bash Concurrency Safety (CRITICAL)
+#
+# Add --top-ports / --full Scan Modes
+#     --top-ports     current list (default)
+#     --full          add common high ports
+#     --web           web-only ports
+#
+# Structured Output Sections (Readability)
+#
+# Normalize Color Semantics (I Defined Them—Use Them)
+#   Right now:
+#    GREEN = open
+#    YELLOW = interesting
+#    RED = dangerous
+#   But:
+#    Some [i] messages use RED and Some warnings use YELLOW
+#  Create wrappers:
+#    info()     # blue
+#    finding()  # yellow
+#    risk()     # red
+#    success()  # green
+#
+# CVE Hints → MITRE ATT&CK Mapping
+#  Port 445 → SMB relay
+#    ATT&CK: T1557, T1021.002
+#
+# Auto-Suggest Exploitation Paths (Still Safe)
+#  [SMB + LDAP + Kerberos]
+#    → Likely Active Directory
+#    → Try AS-REP roast → SMB → WinRM
+#
+# Align output with OSCP-style methodology
+#######################################################
+
+
 set -euo pipefail
 
 START_TIME=$(date +%s)

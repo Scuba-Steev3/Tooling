@@ -13,6 +13,8 @@
 
 set -euo pipefail
 
+START_TIME=$(date +%s)
+
 DEFAULT_TARGET="127.0.0.1"
 TARGET=""
 ENABLE_VHOST=false
@@ -22,9 +24,6 @@ LDAP_FOUND=false
 SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
-
-KERBEROS_FOUND=false
-LDAP_FOUND=false
 
 # --------- Colors ----------
 GREEN="\033[0;32m"
@@ -42,9 +41,11 @@ HTTP_MARKER=$(mktemp)
 HTTPS_MARKER=$(mktemp)
 SMB_MARKER=$(mktemp)
 KERB_MARKER=$(mktemp)
+OPEN_PORTS_FILE=$(mktemp)
 
-trap 'rm -f "$HINT_FILE" "$HOSTS_FILE" "$DISCOVERED_HOSTS" "$REDIRECT_HOSTS" "$HTTP_MARKER" "$HTTPS_MARKER" "$SMB_MARKER"' EXIT
-
+trap 'rm -f "$HINT_FILE" "$HOSTS_FILE" "$DISCOVERED_HOSTS" "$REDIRECT_HOSTS" \
+          "$HTTP_MARKER" "$HTTPS_MARKER" "$SMB_MARKER" "$KERB_MARKER" \
+          "$OPEN_PORTS_FILE"' EXIT
 
 # --------- Argument Parsing ----------
 for arg in "$@"; do
@@ -66,6 +67,11 @@ echo -e "  ${GREEN}GREEN${RESET}  = Open / Standard"
 echo -e "  ${YELLOW}YELLOW${RESET} = Interesting"
 echo -e "  ${RED}RED${RESET}    = High-risk exposure"
 echo "---------------------------"
+
+# --------- Message Helpers ----------
+info()    { echo -e "${BLUE}[i]${RESET} $*"; }
+success() { echo -e "${GREEN}[+]${RESET} $*"; }
+warn()    { echo -e "${RED}[!]${RESET} $*"; }
 
 # --------- SSL Certificate Extraction ----------
 extract_ssl_info() {
@@ -174,6 +180,16 @@ PORTS=(
 # --------- After port scanning completes ----------
 OPEN_PORTS=()   # Will store open ports
 
+echo
+echo -e "${BLUE}========================================${RESET}"
+echo -e "${BLUE} Educational Recon Mode ${RESET}"
+echo -e "${BLUE}----------------------------------------${RESET}"
+echo "  • Authorized environments only (training & lab)"
+echo "  • No exploitation performed automatically"
+echo "  • Output provides learning-oriented next steps"
+echo -e "${BLUE}========================================${RESET}"
+echo
+
 # --------- Function to Scan a Single Port ----------
 # ---------- PORT SCAN LOOP ----------
 for ENTRY in "${PORTS[@]}"; do
@@ -182,7 +198,8 @@ for ENTRY in "${PORTS[@]}"; do
     timeout 2 bash -c "echo >/dev/tcp/$TARGET/$PORT" 2>/dev/null || exit
     
     #Add Port to Open Ports Array
-    OPEN_PORTS+=("$PORT")
+    #OPEN_PORTS+=("$PORT")
+    echo "$PORT" >> "$OPEN_PORTS_FILE"
     
     case "$LEVEL" in
         high) COLOR=$RED ;;
@@ -190,7 +207,8 @@ for ENTRY in "${PORTS[@]}"; do
         *) COLOR=$GREEN ;;
     esac
 
-    echo -e "${COLOR}[+] Port $PORT OPEN ($SERVICE)${RESET}"
+    #echo -e "${COLOR}[+] Port $PORT OPEN ($SERVICE)${RESET}"
+    success "Port $PORT OPEN ($SERVICE)"
 
     case "$PORT" in
         80|8080|3000|5000) echo http >> "$HTTP_MARKER" ;;
@@ -302,6 +320,20 @@ for ENTRY in "${PORTS[@]}"; do
 done
 
 wait
+
+# --------- Reconstruct OPEN_PORTS safely ----------
+OPEN_PORTS=()
+if [ -s "$OPEN_PORTS_FILE" ]; then
+    mapfile -t OPEN_PORTS < <(sort -n "$OPEN_PORTS_FILE")
+fi
+
+# --------- Debug / Visibility ----------
+if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
+    echo
+    info "Open ports detected: ${OPEN_PORTS[*]}"
+else
+    warn "No open ports detected"
+fi
 
 # --------- SMB Enumeration (only if 139 or 445 is open) ----------
 SMB_NULL_OK=false
@@ -592,7 +624,13 @@ EOF
 done
 
 # --------- Cleanup ----------
-rm -f "$HINT_FILE" "$HOSTS_FILE" "$DISCOVERED_HOSTS" "$REDIRECT_HOSTS"
+rm -f "$HINT_FILE" "$HOSTS_FILE" "$DISCOVERED_HOSTS" "$REDIRECT_HOSTS" "$KERB_MARKER"
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo
+info "Scan completed in ${DURATION}s"
 
 echo
 echo "Scan complete."

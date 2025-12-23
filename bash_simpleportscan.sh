@@ -100,17 +100,65 @@ done
 
 $NO_COLOR && GREEN="" YELLOW="" RED="" BLUE="" RESET=""
 
-# --------- Legend ----------
+# 🔥  High risk
+# 💥  Critical exposure
+# ☠   Dangerous
+# 🚨  Alert
+# 🛠  Tooling
+# ⚙   Configuration
+# 📌  Note
+# ➡   Next step
+
+# --------- Icons (UTF-8 with ASCII fallback) ----------
+ICON_OK="✔"
+ICON_WARN="⚠"
+ICON_INFO="ℹ"
+ICON_RISK="🔥"
+ICON_ALERT="🚨"
+ICON_CRIT="💥"
+ICON_SCAN="🔍"
+ICON_SHARE="📁"
+ICON_WEB="🌐"
+ICON_USER="👤"
+
+# ASCII fallback for non-UTF8 terminals
+if [[ "${LANG:-}" != *UTF-8* && "${LC_ALL:-}" != *UTF-8* ]]; then
+    ICON_OK="[+]"
+    ICON_WARN="[!]"
+    ICON_INFO="[i]"
+    ICON_RISK="[!!]"
+    ICON_ALERT="[?]"
+    ICON_CRIT="[!!!]"
+    ICON_SCAN="[scan]"
+    ICON_SHARE="[share]"
+    ICON_WEB="[web]"
+    ICON_USER="[user]"
+fi
+
 echo "Legend:"
-echo -e "  ${GREEN}GREEN${RESET}  = Open / Standard"
-echo -e "  ${YELLOW}YELLOW${RESET} = Interesting"
-echo -e "  ${RED}RED${RESET}    = High-risk exposure"
+echo "---------------------------"
+echo "  $ICON_OK   Open / Success"
+echo "  $ICON_WARN   Interesting / Needs Review"
+echo "  $ICON_RISK  High-Risk Exposure"
+echo "  $ICON_INFO   Informational"
+echo "  $ICON_SCAN  Scanning / Enumeration"
+echo "  $ICON_SHARE  File Shares / Storage"
+echo "  $ICON_WEB  Web Services"
+echo "  $ICON_USER  Users / Identities"
 echo "---------------------------"
 
 # --------- Message Helpers ----------
-info()    { echo -e "${BLUE}[i]${RESET} $*"; }
-success() { echo -e "${GREEN}[+]${RESET} $*"; }
-warn()    { echo -e "${RED}[!]${RESET} $*"; }
+info()      { echo -e "${BLUE}ℹ ${RESET} $*"; }
+success()   { echo -e "${GREEN}✔ ${RESET} $*"; }
+notify()    { echo -e "${YELLOW}⚠ ${RESET} $*"; }
+note()      { echo -e "${BLUE}📌 ${RESET} $*"; }
+finding()   { echo -e "${YELLOW}[?] ${RESET} $*"; }
+warn()      { echo -e "${RED}✖ ${RESET} $*"; }
+risk()      { echo -e "${RED}[!] ${RESET} $*"; }
+high_risk() { echo -e "${RED}🔥 ${RESET} $*"; }
+critical()  { echo -e "${RED}💥 ${RESET} $*"; }
+danger()    { echo -e "${RED}☠ ${RESET} $*"; }
+alert()     { echo -e "${RED}🚨 ${RESET} $*"; }
 
 # --------- SSL Certificate Extraction ----------
 extract_ssl_info() {
@@ -247,7 +295,7 @@ declare -A CVE_HINTS=(
 print_cve_hint() {
     local port="$1"
     if [[ -n "${CVE_HINTS[$port]:-}" ]]; then
-        info "  - ${CVE_HINTS[$port]}"
+        echo -e "  - ${CVE_HINTS[$port]}"
     fi
 }
 
@@ -440,34 +488,34 @@ if [ -s "$SMB_MARKER" ]; then
     }
 
     smb_enum_smbclient() {
-        local AUTH="$1"
-        local LABEL="$2"
+	local AUTH="$1"
+	local LABEL="$2"
 
-        SHARES=$(smbclient -L "//$TARGET" -U "$AUTH" 2>/dev/null \
+	SHARES=$(smbclient -L "//$TARGET" -U "$AUTH" -N 2>/dev/null \
 		| awk '$2 == "Disk" { print $1 }')
 
-        [ -z "$SHARES" ] && return 1
+	[ -z "$SHARES" ] && return 1
 
-        echo -e "  ${RED}[!] SMB allows $LABEL access${RESET}"
-        echo -e "  ${YELLOW}[i] SMB shares ($LABEL):${RESET}"
+	critical "  SMB allows $LABEL access"
+	notify "  $ICON_SHARE SMB shares ($LABEL):"
 
-        for share in $SHARES; do
+	for share in $SHARES; do
 		[[ "$share" =~ ^(IPC\$|ADMIN\$)$ ]] && continue
 
-		smbclient "//$TARGET/$share" -U "$AUTH" -c "ls" >/dev/null 2>&1 \
+		smbclient "//$TARGET/$share" -U "$AUTH" -N -c "ls" >/dev/null 2>&1 \
 		    && READ="yes" || READ="no"
 
-		smbclient "//$TARGET/$share" -U "$AUTH" -c "put /dev/null test_$$_tmp" >/dev/null 2>&1 \
+		smbclient "//$TARGET/$share" -U "$AUTH" -N -c "put /dev/null test_$$_tmp" >/dev/null 2>&1 \
 		    && WRITE="yes" || WRITE="no"
 
 		echo -e "      - $share [read=$(color_perm "$READ") write=$(color_perm "$WRITE")]"
-        done
+	 done
 
-        SMB_ENUM_SUCCESS=true
-        [ "$LABEL" = "NULL session" ] && SMB_NULL_OK=true
-	[ "$LABEL" = "GUEST" ] && SMB_GUEST_OK=true
-        return 0
+	 SMB_ENUM_SUCCESS=true
+	 [ "$LABEL" = "NULL session" ] && SMB_NULL_OK=true
+	 [ "$LABEL" = "GUEST" ] && SMB_GUEST_OK=true
     }
+
     
     smb_enum_smbmap() {
         local AUTH_LABEL="$1"
@@ -484,8 +532,8 @@ if [ -s "$SMB_MARKER" ]; then
 
         [ -z "$OUTPUT" ] && return 1
 	
-        echo -e "  ${RED}[!] SMB allows $AUTH_LABEL access (via smbmap)${RESET}"
-        echo -e "  ${YELLOW}[i] SMB shares ($AUTH_LABEL):${RESET}"
+        critical "  SMB allows $LABEL access"
+	notify "  $ICON_SHARE SMB shares ($LABEL):"
 
         echo "$OUTPUT" | while read -r share perms; do
 		[[ "$share" =~ ^(IPC\$|ADMIN\$)$ ]] && continue
@@ -723,7 +771,7 @@ END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
 echo
-info "Scan completed in ${DURATION}s"
+success "Scan completed in ${DURATION}s"
 
 echo
 echo "Scan complete."

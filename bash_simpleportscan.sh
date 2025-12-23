@@ -61,6 +61,9 @@ SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
 
+# --------- Concurrency ----------
+MAX_JOBS=20
+
 # --------- Colors ----------
 GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
@@ -266,7 +269,10 @@ echo
 
 # --------- Function to Scan a Single Port ----------
 # ---------- PORT SCAN LOOP ----------
-for ENTRY in "${PORTS[@]}"; do
+for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
+    while (( $(jobs -rp | wc -l) >= MAX_JOBS )); do
+        sleep 0.05
+    done
 (
     IFS=: read PORT SERVICE LEVEL <<< "$ENTRY"
     timeout 2 bash -c "echo >/dev/tcp/$TARGET/$PORT" 2>/dev/null || exit
@@ -420,7 +426,7 @@ SMB_NULL_OK=false
 SMB_GUEST_OK=false
 if [ -s "$SMB_MARKER" ]; then
     echo
-    echo -e "${YELLOW}[i] SMB ports detected (139/445) — enumerating shares & permissions...${RESET}"
+    info "SMB ports detected (139/445) — enumerating shares & permissions..."
 
     SMB_ENUM_SUCCESS=false
 
@@ -477,7 +483,7 @@ if [ -s "$SMB_MARKER" ]; then
 		')
 
         [ -z "$OUTPUT" ] && return 1
-
+	
         echo -e "  ${RED}[!] SMB allows $AUTH_LABEL access (via smbmap)${RESET}"
         echo -e "  ${YELLOW}[i] SMB shares ($AUTH_LABEL):${RESET}"
 
@@ -496,25 +502,32 @@ if [ -s "$SMB_MARKER" ]; then
     }
 
     # ---- Try smbclient first ----
-    smb_enum_smbclient "" "NULL session"
-    smb_enum_smbclient "guest%" "GUEST"
+    smb_enum_smbclient "" "NULL session" || true
+    smb_enum_smbclient "guest%" "GUEST" || true
 
     # ---- Fallback to smbmap ----
     if ! $SMB_ENUM_SUCCESS; then
-        echo -e "  ${YELLOW}[i] smbclient yielded no shares — trying smbmap fallback...${RESET}"
-        smb_enum_smbmap "NULL session" ""
-        smb_enum_smbmap "GUEST" "-u guest -p ''"
+        info "smbclient yielded no shares — trying smbmap fallback..."
+        smb_enum_smbmap "NULL session" "" || true
+        smb_enum_smbmap "GUEST" "-u guest -p ''" || true
     fi
     
     # --------- CME User Enumeration (only if SMB access exists) ----------
     if command -v crackmapexec >/dev/null 2>&1; then
+        info "SMB Shares Detected!"
+        info "  Attempting to Enumerate Access..."
         if $SMB_NULL_OK; then
-		cme_enum_users "NULL session" ""
+            cme_enum_users "NULL session" ""
         fi
 
         if $SMB_GUEST_OK; then 
-		cme_enum_users "GUEST" "-u guest -p ''" #TODO: Fix why this isn't running.
+            cme_enum_users "GUEST" "-u guest -p ''"
         fi
+    fi
+
+    # --------- No Shares Found Case ----------
+    if ! $SMB_ENUM_SUCCESS; then
+        info "No SMB Shares Detected. Maybe retry with user creds?"
     fi
 fi
 

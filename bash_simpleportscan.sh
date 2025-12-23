@@ -517,11 +517,11 @@ if [ -s "$SMB_MARKER" ]; then
         info "SMB Shares Detected!"
         info "  Attempting to Enumerate Access..."
         if $SMB_NULL_OK; then
-            cme_enum_users "NULL session" ""
+            cme_enum_users "NULL session" "" || true
         fi
 
         if $SMB_GUEST_OK; then 
-            cme_enum_users "GUEST" "-u guest -p ''"
+            cme_enum_users "GUEST" "-u guest -p ''" || true
         fi
     fi
 

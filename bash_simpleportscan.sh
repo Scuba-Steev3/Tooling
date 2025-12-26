@@ -66,10 +66,19 @@ CREDS_PROVIDED=false
 MAX_JOBS=20
 
 # --------- Colors ----------
+# ---- Base ----
+RED="\033[0;31m"
 GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
-RED="\033[0;31m"
 BLUE="\033[0;34m"
+MAGENTA="\033[0;35m"
+CYAN="\033[0;36m"
+GRAY="\033[0;90m"
+# ---- Bright / Emphasis ----
+BRED="\033[1;31m"
+BGREEN="\033[1;32m"
+BYELLOW="\033[1;33m"
+
 RESET="\033[0m"
 
 # --------- Temporary Files ----------
@@ -220,52 +229,70 @@ cme_enum_users() {
     local AUTH_LABEL="$1"
     local CME_ARGS="$2"
     local FOUND_DESC=0
+
     command -v crackmapexec >/dev/null 2>&1 || return 1
 
     info "Enumerating SMB users via crackmapexec ($AUTH_LABEL)..."
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     echo -e "        ${GREEN}crackmapexec smb $TARGET $CME_ARGS --users${RESET}"
-    # 1) Capture raw CME output exactly as-is
-    #RAW="$(crackmapexec smb "$TARGET" $CME_ARGS --users 2>&1)"
-    # Debug: show exactly what CME returned
-    #echo "[DEBUG] Raw CME output:"
-    #echo "$RAW"
-    
-    OUTPUT=$(crackmapexec smb "$TARGET" $CME_ARGS --users 2>/dev/null \
-        | awk '
-            /^[A-Z]+[[:space:]]+[0-9.]+/ {
-                user=""
-                desc=""
 
-                for (i=1; i<=NF; i++) {
-                    if ($i ~ /\\/) {
-                        split($i,a,"\\")
-                        user=a[2]
-                    }
-                }
+    # Capture full CME output (stdout + stderr)
+    RAW_CME=$(crackmapexec smb "$TARGET" $CME_ARGS --users 2>&1)
 
-                # Capture description if present
-                match($0, /desc:[[:space:]]*(.*)$/, d)
-                if (d[1] != "") {
-                    desc=d[1]
-                }
+    # --- 1. Hard failure: no auth at all ---
+    if echo "$RAW_CME" | grep -qiE '\[-\].*(STATUS_LOGON_FAILURE|NT_STATUS_LOGON_FAILURE|ACCESS_DENIED)'; then
+        notify "SMB authentication failed ($AUTH_LABEL)"
+        return 1
+    fi
 
-                if (user != "") {
-                    print user "|" desc
+    # --- 2. Auth success but enumeration explicitly denied ---
+    if echo "$RAW_CME" | grep -qiE 'Error enumerating domain users|NTLM needs domain\\\\username'; then
+        notify "SMB authentication successful ($AUTH_LABEL), but user enumeration is not permitted"
+        return 0
+    fi
+
+    # --- 3. Parse enumerated users ONLY ---
+    OUTPUT=$(echo "$RAW_CME" | awk '
+        /^[A-Z]+[[:space:]]+[0-9.]+/ {
+            user=""
+            desc=""
+
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /\\/) {
+                    split($i,a,"\\")
+                    user=a[2]
                 }
             }
-        ' | sort -u)
 
-    [[ -z "$OUTPUT" ]] && return 1
+            # Skip self-echo or empty results
+            if (user == "" || tolower(user) == "guest") next
 
-    warn "SMB user enumeration possible ($AUTH_LABEL)"
+            # Capture description if present
+            match($0, /desc:[[:space:]]*(.*)$/, d)
+            if (d[1] != "") {
+                desc=d[1]
+            }
+
+            if (user != "") {
+                print user "|" desc
+            }
+        }
+    ' | sort -u)
+
+    # --- 4. No users parsed (but no explicit failure) ---
+    if [[ -z "$OUTPUT" ]]; then
+        notify "SMB authentication successful ($AUTH_LABEL), but no domain users were returned"
+        return 0
+    fi
+
+    # --- 5. Enumeration succeeded ---
+    high_risk "SMB user enumeration successful ($AUTH_LABEL)"
     echo -e "   ${YELLOW}Users Discovered:${RESET}"
 
     while IFS="|" read -r user desc; do
-        echo "      - $user"
+        echo -e "      - ${BYELLOW}$user${RESET}"
 
         if [[ -n "$desc" ]]; then
-            # Highlight suspicious descriptions
             if echo "$desc" | grep -Ei 'pass|pwd|creds|password|secret|key|cont|contractor|temp' >/dev/null; then
                 echo -e "          ${RED}⚠ Description:${RESET} $desc"
                 echo -e "[LOOT] $TARGET SMB DESC $user : $desc" >> smb_user_descriptions.txt
@@ -276,10 +303,10 @@ cme_enum_users() {
         fi
     done <<< "$OUTPUT"
 
-    # Save clean user list for reuse
+    # Save clean user list
     echo "$OUTPUT" | cut -d'|' -f1 > "users_smb_$TARGET.txt"
-
     success "Saved user list to users_smb_$TARGET.txt"
+
     if [ "$FOUND_DESC" -eq 1 ]; then
         success "Suspicious descriptions logged to smb_user_descriptions.txt"
     fi
@@ -812,6 +839,13 @@ if [ -s "$SMB_MARKER" ]; then
             -e "s/(\.kdbx)/${RED}\1${RESET}/Ig" \
             -e "s/(\.xlsx)/${RED}\1${RESET}/Ig"
     }
+    
+    smb_auth_check() {
+        local AUTH="$1"
+
+	smbclient -L "//$TARGET" -U "$AUTH" -m SMB3 -c 'exit' >/dev/null 2>&1
+	return $?
+    }
 
     smb_list_files() {
         local SHARE="$1"
@@ -962,12 +996,20 @@ if [ -s "$SMB_MARKER" ]; then
 
     # 2) Guest with empty password (matches CME behavior)
     smb_enum_smbclient "guest%" "GUEST" || true
-
+    
+    # 3) Check for authenticated access.
     if $CREDS_PROVIDED; then
-	echo
-	info "Attempting SMB enumeration with provided credentials"
-	smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
-		notify "SMB auth failed for provided credentials"
+        echo
+        info "Attempting SMB authentication with provided credentials"
+
+        if smb_auth_check "$AUTH_USER%$AUTH_PASS"; then
+            success "SMB authentication successful"
+
+            smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
+                notify "Authenticated but no shares are visible to this user"
+        else
+            notify "SMB authentication failed for provided credentials"
+        fi
     fi
 
     # -------- Fallback to smbmap --------
@@ -1018,7 +1060,7 @@ if [ -s "$SMB_MARKER" ]; then
 
             notify "Discovered domain users via RID brute:"
             for user in $USERS; do
-                echo "      - $user"
+                echo -e "      - ${BYELLOW}$user${RESET}"
                 echo "$user" >> "$USERS_FILE"
             done
 
@@ -1071,7 +1113,7 @@ if $CREDS_PROVIDED; then
            | grep -qi success; then
            critical "WinRM credential reuse confirmed"
        else
-           notify "WinRM authentication failed or not permitted"
+           warn "WinRM authentication failed or not permitted"
        fi
     fi
 

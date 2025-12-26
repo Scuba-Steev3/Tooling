@@ -21,18 +21,6 @@
 #
 # Structured Output Sections (Readability)
 #
-# Normalize Color Semantics (I Defined Them—Use Them)
-#   Right now:
-#    GREEN = open
-#    YELLOW = interesting
-#    RED = dangerous
-#   But:
-#    Some [i] messages use RED and Some warnings use YELLOW
-#  Create wrappers:
-#    info()     # blue
-#    finding()  # yellow
-#    risk()     # red
-#    success()  # green
 #
 # CVE Hints → MITRE ATT&CK Mapping
 #  Port 445 → SMB relay
@@ -42,6 +30,9 @@
 #  [SMB + LDAP + Kerberos]
 #    → Likely Active Directory
 #    → Try AS-REP roast → SMB → WinRM
+#
+# Fix why "SMB auth failed for provided credentials" is displayed
+#    when the creds clearly output SMB Shares.
 #
 # Align output with OSCP-style methodology
 #######################################################
@@ -64,6 +55,12 @@ LDAP_DOMAIN=""
 SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
+
+# --- Passing in User Info -----
+AUTH_USER=""
+AUTH_PASS=""
+AUTH_DOMAIN=""
+CREDS_PROVIDED=false
 
 # --------- Concurrency ----------
 MAX_JOBS=20
@@ -97,9 +94,16 @@ for arg in "$@"; do
         --no-color) NO_COLOR=true ;;
         --vhost) ENABLE_VHOST=true ;;
         --kerb-enum) ENABLE_KERB_ENUM=true ;;
+        --user=*) AUTH_USER="${arg#*=}" ;;
+        --pass=*) AUTH_PASS="${arg#*=}" ;;
+        --domain=*) AUTH_DOMAIN="${arg#*=}" ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
+
+if [ -n "$AUTH_DOMAIN" ] && [ -z "$LDAP_DOMAIN" ]; then
+    LDAP_DOMAIN="${AUTH_DOMAIN,,}"
+fi
 
 [ -z "$TARGET" ] && TARGET="$DEFAULT_TARGET" && echo "[i] No IP provided — defaulting to $TARGET"
 
@@ -125,6 +129,8 @@ ICON_SCAN="🔍"
 ICON_SHARE="📁"
 ICON_WEB="🌐"
 ICON_USER="👤"
+ICON_TIP="💡"
+ICON_PIN="📌"
 
 # ASCII fallback for non-UTF8 terminals
 if [[ "${LANG:-}" != *UTF-8* && "${LC_ALL:-}" != *UTF-8* ]]; then
@@ -138,8 +144,11 @@ if [[ "${LANG:-}" != *UTF-8* && "${LC_ALL:-}" != *UTF-8* ]]; then
     ICON_SHARE="[share]"
     ICON_WEB="[web]"
     ICON_USER="[user]"
+    ICON_TIP="[TIP]"
+    ICON_PIN="[O--]"
 fi
 
+echo
 echo "Legend:"
 echo "---------------------------"
 echo "  $ICON_OK   Open / Success"
@@ -150,20 +159,22 @@ echo "  $ICON_SCAN  Scanning / Enumeration"
 echo "  $ICON_SHARE  File Shares / Storage"
 echo "  $ICON_WEB  Web Services"
 echo "  $ICON_USER  Users / Identities"
+echo "  $ICON_TIP  Tip/Copyable Commands"
 echo "---------------------------"
 
 # --------- Message Helpers ----------
 info()      { echo -e "${BLUE}ℹ ${RESET} $*"; }
-success()   { echo -e "${GREEN}✔ ${RESET} $*"; }
-notify()    { echo -e "${YELLOW}⚠ ${RESET} $*"; }
-note()      { echo -e "${BLUE}📌 ${RESET} $*"; }
+success()   { echo -e "${GREEN}${ICON_OK} ${RESET} $*"; }
+notify()    { echo -e "${YELLOW}${ICON_WARN} ${RESET} $*"; }
+note()      { echo -e "${BLUE}${ICON_PIN} ${RESET} $*"; }
 finding()   { echo -e "${YELLOW}[?] ${RESET} $*"; }
 warn()      { echo -e "${RED}✖ ${RESET} $*"; }
 risk()      { echo -e "${RED}[!] ${RESET} $*"; }
-high_risk() { echo -e "${RED}🔥 ${RESET} ${RED}$*${RESET}"; }
-critical()  { echo -e "${RED}💥 ${RESET} ${RED}$*${RESET}"; }
+high_risk() { echo -e "${RED}${ICON_RISK} ${RESET} ${RED}$*${RESET}"; }
+critical()  { echo -e "${RED}${ICON_CRIT} ${RESET} ${RED}$*${RESET}"; }
 danger()    { echo -e "${RED}☠ ${RESET} $*"; }
-alert()     { echo -e "${RED}🚨 ${RESET} $*"; }
+alert()     { echo -e "${RED}${ICON_ALERT} ${RESET} $*"; }
+lightbulb() { echo -e "${YELLOW}${ICON_TIP} ${RESET} $*"; }
 
 # --------- SSL Certificate Extraction ----------
 extract_ssl_info() {
@@ -178,13 +189,13 @@ extract_ssl_info() {
         | sed -n 's/.*DNS://p' | tr ',' '\n' | sed 's/^[[:space:]]*//')
 
     [ -n "$cn" ] && {
-        echo -e "${YELLOW}[i] SSL CN: $cn${RESET}"
+        finding "SSL CN: $cn"
         echo "$TARGET $cn" >> "$HOSTS_FILE"
         echo "$cn" >> "$DISCOVERED_HOSTS"
     }
 
     if [ -n "$sans" ]; then
-        echo -e "${YELLOW}[i] SSL SANs:${RESET}"
+        finding "SSL SANs:"
         echo "$sans" | while read san; do
             [ -n "$san" ] && {
                 echo -e "${YELLOW}    - $san${RESET}"
@@ -204,130 +215,292 @@ getnpusers_cmd() {
         return 1
     fi
 }
+
 cme_enum_users() {
     local AUTH_LABEL="$1"
     local CME_ARGS="$2"
-
+    local FOUND_DESC=0
     command -v crackmapexec >/dev/null 2>&1 || return 1
 
     info "Enumerating SMB users via crackmapexec ($AUTH_LABEL)..."
-
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}crackmapexec smb $TARGET $CME_ARGS --users${RESET}"
+    # 1) Capture raw CME output exactly as-is
+    #RAW="$(crackmapexec smb "$TARGET" $CME_ARGS --users 2>&1)"
+    # Debug: show exactly what CME returned
+    #echo "[DEBUG] Raw CME output:"
+    #echo "$RAW"
+    
     OUTPUT=$(crackmapexec smb "$TARGET" $CME_ARGS --users 2>/dev/null \
-        | awk '/^[^ ]+\\[^ ]+/ {print $1}' \
-        | sed 's/.*\\//' \
-        | sort -u)
+        | awk '
+            /^[A-Z]+[[:space:]]+[0-9.]+/ {
+                user=""
+                desc=""
 
-    [ -z "$OUTPUT" ] && return 1
+                for (i=1; i<=NF; i++) {
+                    if ($i ~ /\\/) {
+                        split($i,a,"\\")
+                        user=a[2]
+                    }
+                }
+
+                # Capture description if present
+                match($0, /desc:[[:space:]]*(.*)$/, d)
+                if (d[1] != "") {
+                    desc=d[1]
+                }
+
+                if (user != "") {
+                    print user "|" desc
+                }
+            }
+        ' | sort -u)
+
+    [[ -z "$OUTPUT" ]] && return 1
+
     warn "SMB user enumeration possible ($AUTH_LABEL)"
     echo -e "   ${YELLOW}Users Discovered:${RESET}"
 
-    echo "$OUTPUT" | while read -r user; do
+    while IFS="|" read -r user desc; do
         echo "      - $user"
-    done
+
+        if [[ -n "$desc" ]]; then
+            # Highlight suspicious descriptions
+            if echo "$desc" | grep -Ei 'pass|pwd|creds|password|secret|key|cont|contractor|temp' >/dev/null; then
+                echo -e "          ${RED}⚠ Description:${RESET} $desc"
+                echo -e "[LOOT] $TARGET SMB DESC $user : $desc" >> smb_user_descriptions.txt
+                FOUND_DESC=1
+            else
+                echo -e "          ℹ Description: $desc"
+            fi
+        fi
+    done <<< "$OUTPUT"
+
+    # Save clean user list for reuse
+    echo "$OUTPUT" | cut -d'|' -f1 > "users_smb_$TARGET.txt"
+
+    success "Saved user list to users_smb_$TARGET.txt"
+    if [ "$FOUND_DESC" -eq 1 ]; then
+        success "Suspicious descriptions logged to smb_user_descriptions.txt"
+    fi
 
     return 0
 }
 
 ldap_enum() {
+    local USE_AUTH="$1"
+    local PASSED_DOMAIN="${2:-}"
+
+    # LDAP is noisy — do not let set -e kill enumeration
+    set +e
+
     command -v ldapsearch >/dev/null 2>&1 || {
         warn "ldapsearch not found — skipping LDAP enumeration"
+        set -e
         return
     }
 
     echo
     info "LDAP detected — starting safe LDAP enumeration"
 
-    # Prefer LDAP over LDAPS for anon checks, fallback if needed
-    if echo "$OPEN_PORTS_FILE" | grep -q '^636$'; then
+    ########################################
+    # 1. Protocol Selection (LDAP FIRST)
+    ########################################
+    LDAP_URI="ldap://$TARGET"
+    # Use LDAPS only if LDAP (389) is NOT open and LDAPS (636) IS open
+    if ! grep -qx 389 "$OPEN_PORTS_FILE" 2>/dev/null \
+        && grep -qx 636 "$OPEN_PORTS_FILE" 2>/dev/null; then
         LDAP_URI="ldaps://$TARGET"
-    else
-        LDAP_URI="ldap://$TARGET"
     fi
 
-    # -------- RootDSE --------
-    info "Querying LDAP RootDSE"
+    info "Using LDAP URI: $LDAP_URI"
 
-    LDAP_BASE_DN=$(ldapsearch -x -H "$LDAP_URI" -s base -b "" defaultNamingContext 2>/dev/null \
-        | sed -n 's/^defaultNamingContext:[[:space:]]*//p')
+    ########################################
+    # 2. Bind Arguments
+    ########################################
+    LDAP_BIND_ARGS="-x"
 
-    if [[ ! "$LDAP_BASE_DN" =~ ^DC= ]]; then
+    if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
+        info "Using authenticated LDAP bind"
+        LDAP_BIND_ARGS="-x -D ${AUTH_DOMAIN:+$AUTH_DOMAIN\\}$AUTH_USER -w $AUTH_PASS"
+    fi
+
+    ########################################
+    # 3. Base DN Resolution (STATE-AWARE)
+    ########################################
+
+    # 3a. If BASE DN already known — reuse it
+    if [[ -n "$LDAP_BASE_DN" && "$LDAP_BASE_DN" =~ ^DC= ]]; then
+        info "Reusing previously discovered LDAP base DN"
+    else
+        # 3b. If domain passed explicitly — derive Base DN
+        if [[ -n "$PASSED_DOMAIN" ]]; then
+            info "Using provided domain for LDAP base DN"
+            LDAP_DOMAIN="${PASSED_DOMAIN,,}"
+            LDAP_BASE_DN=$(echo "$LDAP_DOMAIN" | awk -F. '{
+                for (i=1;i<=NF;i++)
+                    printf "DC=%s%s", toupper($i), (i<NF?",":"")
+            }')
+        else
+            # 3c. Query RootDSE over LDAP FIRST
+            info "Querying LDAP RootDSE for naming context"
+
+            LDAP_BASE_DN=$(
+                ldapsearch -x -H ldap://$TARGET -s base -b "" defaultNamingContext 2>/dev/null \
+                | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
+            )
+
+            # 3d. Fallback to LDAPS only if LDAP fails AND auth is used
+            if [[ -z "$LDAP_BASE_DN" && "$USE_AUTH" == "auth" ]] && grep -qx 636 "$OPEN_PORTS_FILE"; then
+                notify "LDAP RootDSE failed — retrying over LDAPS"
+                LDAP_BASE_DN=$(
+                    ldapsearch -x -H ldaps://$TARGET -s base -b "" defaultNamingContext 2>/dev/null \
+                    | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
+                )
+            fi
+        fi
+
+        # Derive domain if Base DN resolved
+        if [[ "$LDAP_BASE_DN" =~ ^DC= ]]; then
+            LDAP_DOMAIN=$(echo "$LDAP_BASE_DN" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
+        fi
+    fi
+
+    ########################################
+    # 4. Validate Naming Context
+    ########################################
+    if [[ -z "$LDAP_BASE_DN" || ! "$LDAP_BASE_DN" =~ ^DC= ]]; then
         notify "LDAP present but naming context not disclosed"
+        set -e
         return
     fi
-
-    LDAP_DOMAIN=$(echo "$LDAP_BASE_DN" | sed 's/DC=//g; s/,/./g')
 
     success "LDAP domain identified: $LDAP_DOMAIN"
     note "Base DN: $LDAP_BASE_DN"
 
     echo "$TARGET $LDAP_DOMAIN" >> "$HOSTS_FILE"
 
-    # -------- Anonymous Bind Test --------
-    info "Testing anonymous LDAP bind"
+    ########################################
+    # 5. Anonymous Bind Test (Only if anon)
+    ########################################
+    if [[ "$USE_AUTH" != "auth" ]]; then
+        info "Testing anonymous LDAP bind"
 
-    if ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" -s base "(objectClass=*)" \
-        >/dev/null 2>&1; then
+        ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" -s base "(objectClass=*)" \
+            >/dev/null 2>&1
+
+        if [[ $? -ne 0 ]]; then
+            notify "Anonymous LDAP bind not permitted"
+            set -e
+            return
+        fi
+
         critical "Anonymous LDAP bind allowed"
         LDAP_ANON_BIND=true
-    else
-        notify "Anonymous bind not permitted"
-        return
     fi
 
-    # -------- Domain Info --------
-    info "Enumerating domain password policy"
+    ########################################
+    # 6. Enumeration (Read-Only)
+    ########################################
 
-    ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+    info "Enumerating domain password policy"
+    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(objectClass=domainDNS)" \
         minPwdLength lockoutThreshold maxPwdAge 2>/dev/null \
         | sed 's/^/    /'
 
-    # -------- Users --------
     info "Enumerating users"
-
-    ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(&(objectClass=user)(!(objectClass=computer)))" \
         sAMAccountName userPrincipalName 2>/dev/null \
         | awk '/^sAMAccountName:/ {print "    - "$2}'
 
-    # -------- Groups --------
     info "Enumerating groups"
-
-    ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(objectClass=group)" cn 2>/dev/null \
         | awk '/^cn:/ {print "    - "$2}'
 
-    # -------- Computers --------
     info "Enumerating computers"
-
-    ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(objectClass=computer)" dNSHostName 2>/dev/null \
         | awk '/^dNSHostName:/ {print "    - "$2}'
 
-    # -------- LAPS --------
+    ########################################
+    # 7. High-Impact Checks
+    ########################################
+
     info "Checking for LAPS exposure"
-
-    ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+    if ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(ms-MCS-AdmPwd=*)" ms-MCS-AdmPwdExpirationTime 2>/dev/null \
-        | grep -q ms-MCS-AdmPwd && \
+        | grep -q ms-MCS-AdmPwd; then
         critical "LAPS attributes readable (HIGH RISK)"
+    fi
 
-    # -------- Delegation / SPNs --------
     info "Searching for Kerberos SPNs"
-
-    ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(servicePrincipalName=*)" servicePrincipalName sAMAccountName 2>/dev/null \
+    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+        "(servicePrincipalName=*)" sAMAccountName servicePrincipalName 2>/dev/null \
         | awk '/^sAMAccountName:/ {print "    - "$2}'
 
-    # -------- Optional ldapdomaindump --------
+    ########################################
+    # 8. Optional ldapdomaindump
+    ########################################
     if command -v ldapdomaindump >/dev/null 2>&1; then
         info "Running ldapdomaindump (read-only)"
-        mkdir -p ldap_dump_$TARGET
-        ldapdomaindump -u '' -p '' -o ldap_dump_$TARGET "$LDAP_URI" >/dev/null 2>&1 && \
-            success "ldapdomaindump completed (ldap_dump_$TARGET)"
+        mkdir -p "ldap_dump_$TARGET"
+        ldapdomaindump -u '' -p '' -o "ldap_dump_$TARGET" "$LDAP_URI" >/dev/null 2>&1 \
+            && success "ldapdomaindump completed (ldap_dump_$TARGET)"
+    fi
+
+    ########################################
+    # 9. Auth-Only Enumeration
+    ########################################
+    if [[ "$USE_AUTH" == "auth" ]]; then
+        echo
+        critical "Authenticated LDAP access confirmed"
+
+        info "Enumerating all domain users (authenticated)"
+
+        ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+            "(&(objectClass=user)(!(objectClass=computer)))" \
+            sAMAccountName memberOf userPrincipalName 2>/dev/null \
+        | awk '
+            /^sAMAccountName:/ {
+                user=$2
+                print "    - " user
+            }
+        '
     fi
 
     LDAP_ENUM_DONE=true
+    set -e
+}
+
+kerberos_auth_check() {
+    #echo "[DEBUG] Inside Kerberos_Auth_Check()"
+    if ! command -v kinit >/dev/null 2>&1; then
+        notify "kinit not found/installed — skipping Kerberos auth check"
+        return 0
+    fi
+    echo "[DEBUG]     running..."
+    local REALM="${LDAP_DOMAIN:-}"
+    REALM="${REALM^^}"
+
+    if [ -z "$REALM" ]; then
+        notify "Kerberos detected but domain not yet known — skipping Kerberos auth check"
+        return
+    fi
+
+    echo
+    info "Validating Kerberos credentials (safe check)"
+
+    if echo "$AUTH_PASS" | kinit "$AUTH_USER@$REALM" >/dev/null 2>&1; then
+        success "Kerberos authentication successful"
+        kdestroy
+        KERB_AUTH_OK=true
+    else
+        notify "Kerberos authentication failed (this is not fatal)"
+    fi
+
 }
 
 
@@ -422,6 +595,17 @@ echo "  • Output provides learning-oriented next steps"
 echo -e "${BLUE}========================================${RESET}"
 echo
 
+if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
+    CREDS_PROVIDED=true
+    success "Credentials provided for authenticated checks"
+    echo -e "   - User:      ${YELLOW}$AUTH_USER${RESET}"
+    echo -e "   - Password:  ${YELLOW}$AUTH_PASS${RESET}"
+    if [ -n "$AUTH_DOMAIN" ] ; then
+        echo -e "   - Domain:    ${YELLOW}$AUTH_DOMAIN${RESET}"
+    fi
+    echo
+fi
+
 # --------- Function to Scan a Single Port ----------
 # ---------- PORT SCAN LOOP ----------
 for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
@@ -479,7 +663,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
     
     #  Kerberos Check
     if [ "$PORT" = "88" ]; then
-        echo -e "  ${YELLOW}[i] Kerberos service detected${RESET}"
+        #echo -e "  ${YELLOW}[i] Kerberos service detected${RESET}"
 
 	if $ENABLE_KERB_ENUM; then
 	    KERB_CMD=$(getnpusers_cmd 2>/dev/null || true)
@@ -521,12 +705,13 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
 	    )
 
         if [[ "$ldap_dn" =~ ^DC= ]]; then
-		ldap_domain=$(echo "$ldap_dn" | sed 's/DC=//g; s/,/./g')
+		LDAP_DOMAIN=$(echo "$ldap_dn" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
+		note "LDAP domain detected: ${GREEN}$LDAP_DOMAIN${RESET}"
 		
-		note "LDAP domain detected: ${GREEN}$ldap_domain${RESET}"
+		note "LDAP domain detected: ${GREEN}$LDAP_DOMAIN${RESET}"
 
-		echo "$TARGET $ldap_domain" >> "$HOSTS_FILE"
-		echo "$ldap_domain" >> "$DISCOVERED_HOSTS"
+		echo "$TARGET $LDAP_DOMAIN" >> "$HOSTS_FILE"
+		echo "$LDAP_DOMAIN" >> "$DISCOVERED_HOSTS"
 		echo "LDAP" >> "$HINT_FILE"
 		echo "KERBEROS" >> "$HINT_FILE"
         else
@@ -553,6 +738,10 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
 done
 
 wait
+
+HAS_SMB=$(grep -q SMB "$HINT_FILE" && echo 1 || echo 0)
+HAS_LDAP=$(grep -q LDAP "$HINT_FILE" && echo 1 || echo 0)
+HAS_KERB=$(grep -q KERBEROS "$HINT_FILE" && echo 1 || echo 0)
 
 # --------- Reconstruct OPEN_PORTS safely ----------
 OPEN_PORTS=()
@@ -615,10 +804,80 @@ if [ -s "$SMB_MARKER" ]; then
             echo -e "${RED}no${RESET}"
         fi
     }
+    
+    highlight_keywords() {
+        sed -E \
+            -e "s/(password|passwd|pwd)/${RED}\1${RESET}/Ig" \
+            -e "s/(backup|bak|old)/${RED}\1${RESET}/Ig" \
+            -e "s/(\.kdbx)/${RED}\1${RESET}/Ig" \
+            -e "s/(\.xlsx)/${RED}\1${RESET}/Ig"
+    }
+
+    smb_list_files() {
+        local SHARE="$1"
+        local AUTH="$2"
+        local LABEL="$3"
+
+        echo -e "        ${BLUE}$ICON_SHARE Listing files in //$TARGET/$SHARE ($LABEL, read-only)${RESET}"
+	
+	# ---- NEW: Copy-paste helper ----
+        local USER="${AUTH%%%*}"
+        local PASS="${AUTH#*%}"
+
+        if [ -z "$USER" ]; then
+            COPY_CMD="smbclient //$TARGET/$SHARE -N"
+        elif [ -z "$PASS" ]; then
+            COPY_CMD="smbclient //$TARGET/$SHARE -U $USER"
+        else
+            COPY_CMD="smbclient //$TARGET/$SHARE -U '$USER%$PASS'"
+        fi
+
+        echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "           ${GREEN}$COPY_CMD${RESET}"
+	
+        # Root listing first (most reliable)
+        ROOT_LIST=$(timeout 6 smbclient "//$TARGET/$SHARE" -U "$AUTH" \
+             -c "ls" 2>/dev/null)
+
+        if echo "$ROOT_LIST" | grep -q 'NT_STATUS'; then
+            echo -e "          ${YELLOW}(directory listing restricted)${RESET}"
+            return
+        fi
+
+        echo "$ROOT_LIST" \
+            | awk '
+                /blocks of size/ {next}
+                /NT_STATUS/ {next}
+                NF {print}
+            ' \
+            | highlight_keywords \
+            | sed 's/^/          - /'
+
+        # Loot detection
+        if echo "$ROOT_LIST" | grep -Eqi '(password|passwd|pwd|backup|\.kdbx|\.xlsx)'; then
+            critical "        High-value files detected in //$TARGET/$SHARE"
+        fi
+
+        # Optional shallow recursion (safe)
+        SUBDIRS=$(echo "$ROOT_LIST" | awk '$1 ~ /^d/ {print $NF}')
+
+        for dir in $SUBDIRS; do
+            echo -e "          ${BLUE}↳ $dir/${RESET}"
+            timeout 4 smbclient "//$TARGET/$SHARE" -U "$AUTH" \
+                -c "cd \"$dir\"; ls" 2>/dev/null \
+                | awk '
+                    /blocks of size/ {next}
+                    /NT_STATUS/ {next}
+                    NF {print}
+                ' \
+                | highlight_keywords \
+                | sed 's/^/            - /'
+        done
+    }
 
     # -------- smbclient enumeration (NULL + GUEST explicitly) --------
     smb_enum_smbclient() {
-        local AUTH="$1"
+        local AUTH="$1" # User
         local LABEL="$2"
 
         SHARES=$(smbclient -L "//$TARGET" -U "$AUTH" 2>/dev/null \
@@ -627,7 +886,7 @@ if [ -s "$SMB_MARKER" ]; then
         [ -z "$SHARES" ] && return 1
 
         critical "  SMB allows $LABEL access"
-        notify "  $ICON_SHARE SMB shares ($LABEL):"
+        notify "   $ICON_SHARE SMB shares ($LABEL):"
 
         for share in $SHARES; do
             [[ "$share" =~ ^(IPC\$|ADMIN\$)$ ]] && continue
@@ -639,6 +898,11 @@ if [ -s "$SMB_MARKER" ]; then
                 && WRITE="yes" || WRITE="no"
 
             echo -e "      - $share [read=$(color_perm "$READ") write=$(color_perm "$WRITE")]"
+            if [ "$READ" = "yes" ]; then
+            	# Read Share Contents - List Files.
+            	#echo "     [DEBUG] smb_enum_smbclient()"
+   		smb_list_files "$share" "$AUTH" "$LABEL"
+	    fi
         done
 
         SMB_ENUM_SUCCESS=true
@@ -648,7 +912,7 @@ if [ -s "$SMB_MARKER" ]; then
 
     # -------- smbmap fallback --------
     smb_enum_smbmap() {
-        local LABEL="$1"
+        local LABEL="$1" # User
         local SMBMAP_ARGS="$2"
 
         command -v smbmap >/dev/null 2>&1 || return 1
@@ -671,8 +935,20 @@ if [ -s "$SMB_MARKER" ]; then
             perms=$(echo "$perms" | tr '[:upper:]' '[:lower:]')
             [[ "$perms" =~ read ]] && READ="yes" || READ="no"
             [[ "$perms" =~ write ]] && WRITE="yes" || WRITE="no"
+	    
+	    if [ "$READ" = "yes" ] && [[ "$share" =~ ^(NETLOGON|SYSVOL)$ ]]; then
+         	critical "  READ access to $share — Active Directory attack surface exposed"
 
+         	echo "KERBEROS" >> "$HINT_FILE"
+    	    	echo "LDAP" >> "$HINT_FILE"
+	    fi
+	    
             echo -e "      - $share [read=$(color_perm "$READ") write=$(color_perm "$WRITE")]"
+            if [ "$READ" = "yes" ]; then
+            	#Attempt to list files in Share that you have "Read" Access to.
+            	# echo "         [DEBUG] SMBMAP()"
+    		smb_list_files "$share" "$LABEL" ""
+	    fi
         done
 
         SMB_ENUM_SUCCESS=true
@@ -686,6 +962,13 @@ if [ -s "$SMB_MARKER" ]; then
 
     # 2) Guest with empty password (matches CME behavior)
     smb_enum_smbclient "guest%" "GUEST" || true
+
+    if $CREDS_PROVIDED; then
+	echo
+	info "Attempting SMB enumeration with provided credentials"
+	smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
+		notify "SMB auth failed for provided credentials"
+    fi
 
     # -------- Fallback to smbmap --------
     if ! $SMB_ENUM_SUCCESS; then
@@ -706,6 +989,11 @@ if [ -s "$SMB_MARKER" ]; then
         if $SMB_GUEST_OK; then
             cme_enum_users "GUEST" "-u guest -p ''" || true
         fi
+        
+        if $CREDS_PROVIDED; then 
+            cme_enum_users "AUTHENTICATED" "-u $AUTH_USER -p $AUTH_PASS" || true
+        fi
+         
     fi
 
     # -------- CME RID Brute (CRITICAL if Guest allowed) --------
@@ -735,6 +1023,9 @@ if [ -s "$SMB_MARKER" ]; then
             done
 
             note "User list saved to: ${GREEN}$USERS_FILE${RESET}"
+            lightbulb " Maybe try a Password Spary if you know a 'default' Password"
+            lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
+             echo -e "        crackmapexec smb ${TARGET} -u $USERS_FILE -p 'ADefaultPassword'"
 
             # Feed recon hints
             echo "KERBEROS" >> "$HINT_FILE"
@@ -750,10 +1041,53 @@ if [ -s "$SMB_MARKER" ]; then
     fi
 fi
 
-
 # --------- LDAP Enumeration ----------
 if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
-    ldap_enum
+    echo "LDAP_ENUM ANON"
+    ldap_enum anon "${AUTH_DOMAIN:-$LDAP_DOMAIN}"
+
+    echo "LDAP_ENUM With Creds"
+    $CREDS_PROVIDED && ldap_enum auth "${AUTH_DOMAIN:-$LDAP_DOMAIN}"
+fi
+
+
+if $CREDS_PROVIDED; then
+    #echo "[DEBUG] Creds were provided"
+    # Check creds is Kerberos Service is deteted.
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "88"; then
+        KERB_AUTH_OK=false
+        $CREDS_PROVIDED && kerberos_auth_check || true
+    fi
+ 
+    echo
+    info "Single-shot credential reuse check..."   
+    # WinRM
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "5985" \
+       && command -v crackmapexec >/dev/null; then
+
+       #echo "[DEBUG] Creds were provided for CME targeting WINRM"
+
+       if crackmapexec winrm "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
+           | grep -qi success; then
+           critical "WinRM credential reuse confirmed"
+       else
+           notify "WinRM authentication failed or not permitted"
+       fi
+    fi
+
+    # MSSQL
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "1433" \
+       && command -v crackmapexec >/dev/null; then
+
+       #echo "[DEBUG] Creds were provided for CME targeting MSSQL"
+
+       if crackmapexec mssql "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
+            | grep -qi success; then
+            critical "MSSQL credential reuse confirmed"
+        else
+            notify "MSSQL authentication failed or not permitted"
+        fi
+    fi
 fi
 
 # -------- Kerberos Reminder --------
@@ -771,6 +1105,10 @@ HTTP_FOUND=false
 HTTPS_FOUND=false
 [ -s "$HTTP_MARKER" ] && HTTP_FOUND=true
 [ -s "$HTTPS_MARKER" ] && HTTPS_FOUND=true
+HAS_WEB=0
+if [ -s "$HTTP_MARKER" ] || [ -s "$HTTPS_MARKER" ]; then
+    HAS_WEB=1
+fi
 rm -f "$HTTP_MARKER" "$HTTPS_MARKER"
 
 # --------- Merge redirect hosts ----------
@@ -839,6 +1177,24 @@ echo
 echo -e "${BLUE}============================${RESET}"
 echo -e "${BLUE}Recon Summary & Next Steps${RESET}"
 echo -e "${BLUE}============================${RESET}"
+
+if [[ $HAS_SMB -eq 1 && $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 ]]; then
+    critical "ATTACK SURFACE: ACTIVE DIRECTORY"
+    lightbulb "Suggested path:"
+    echo "    → Kerberos user enum"
+    echo "    → AS-REP roast"
+    echo "    → SMB share creds"
+    echo "    → WinRM / RDP"
+    echo "    → User / Password Spray"
+    echo
+elif [[ $HAS_SMB -eq 1 ]]; then
+    alert "ATTACK SURFACE: FILE SHARES / WINDOWS HOST"
+elif [[ $HAS_WEB -eq 1 ]]; then
+    alert "ATTACK SURFACE: WEB APPLICATION"
+fi
+if [[ $HAS_WEB -eq 1 && $HAS_SMB -eq 1 ]]; then
+    finding "  Web + SMB attack surface overlap detected"
+fi
 
 sort -u "$HINT_FILE" | while read HINT; do
     case "$HINT" in

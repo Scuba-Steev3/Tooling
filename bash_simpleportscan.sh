@@ -63,6 +63,7 @@ LDAP_DOMAIN=""
 SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
+KERBEROAST_FILE=""
 KERB_DETECTED=false
 KERB_ENUM_DONE=false
 KERB_REALM=""
@@ -72,7 +73,11 @@ LAPS_READABLE=false
 WEB_DETECTED=false
 WINRM_DETECTED=false
 SSH_DETECTED=false
+ASREP_OK=falseclear
 KERBEROS_AUTH_OK=false
+HAS_WEB=0
+HTTP_FOUND=false
+HTTPS_FOUND=false
 
 # --- Passing in User Info -----
 AUTH_USER=""
@@ -123,6 +128,8 @@ for arg in "$@"; do
         --kerb-enum) ENABLE_KERB_ENUM=true ;;
         --user=*) AUTH_USER="${arg#*=}" ;;
         --pass=*) AUTH_PASS="${arg#*=}" ;;
+        -u=*) AUTH_USER="${arg#*=}" ;;
+        -p=*) AUTH_PASS="${arg#*=}" ;;
         --domain=*) AUTH_DOMAIN="${arg#*=}" ;;
         --web-enum) ENABLE_WEB_ENUM=true ;;
         --run-blood) ENABLE_BH_EXPORT=true ;;
@@ -1008,6 +1015,60 @@ ftp_auth_check() {
     return 
 }
 
+# --- Web Directory Fuzzing Function ---
+run_ffuf_enum() {
+    local SCHEME=$1
+    local PORT=$2
+    local TARGET_IP=$3
+    local URL="${SCHEME}://${TARGET_IP}:${PORT}"
+    local FFUF_OUT="ffuf_${TARGET_IP}_${PORT}.json"
+    
+    info "Starting ffuf on $URL"
+    
+    local FFUF_WORDLIST=$(mktemp)
+    printf "%s\n" "${COMMON_FUFF_PATHS[@]}" > "$FFUF_WORDLIST"
+    printf "%s\n" "${COMMON_FUFF_PATHS[@]/%/.php}" >> "$FFUF_WORDLIST"
+    
+    ffuf -u "$URL/FUZZ" -w "$FFUF_WORDLIST" \
+        -mc 200,204,301,302,307,401,403 -fc 404 \
+        -t 100 -timeout 5 -o "$FFUF_OUT" -of json > /dev/null 2>&1
+
+    if [ -s "$FFUF_OUT" ]; then
+        success "Results for $URL saved to $FFUF_OUT"
+        if command -v jq >/dev/null; then
+            jq -r '.results[] | "\(.status) \(.url)"' "$FFUF_OUT" | sed "s|^|    - |"
+        fi
+    fi
+    rm -f "$FFUF_WORDLIST"
+}
+
+# --- VHost Fuzzing Function ---
+run_vhost_fuzz() {
+    local SCHEME=$1
+    local PORT=$2
+    local TARGET_IP=$3
+    local URL="${SCHEME}://${TARGET_IP}:${PORT}"
+    
+    info "Starting VHost fuzzing on $URL"
+    
+    # Get baseline for this specific port
+    local CURL_CMD="curl -s -o /dev/null -L"
+    [[ "$SCHEME" == "https" ]] && CURL_CMD="curl -ks -o /dev/null -L"
+    
+    local BASE_LEN=$($CURL_CMD -w "%{http_code}:%{size_download}" "$URL")
+
+    sort -u "$DISCOVERED_HOSTS" | grep -v '^$' | while read base_domain; do
+        for word in "${COMMON_VHOSTS[@]}"; do
+            local vhost="$word.$base_domain"
+            local res=$($CURL_CMD -H "Host: $vhost" -w "%{http_code}:%{size_download}" "$URL")
+            if [[ "$res" != "$BASE_LEN" ]]; then
+                echo -e "${YELLOW}      [+] Found VHost: $vhost ($URL)${RESET}"
+                echo "$TARGET_IP $vhost" >> "$HOSTS_FILE"
+            fi
+        done
+    done
+}
+
 # --------- Ports ----------
 PORTS=(
     "21:FTP:interesting"
@@ -1097,7 +1158,6 @@ echo "  • Authorized environments only (training & lab)"
 echo "  • No exploitation performed automatically"
 echo "  • Output provides learning-oriented next steps"
 echo -e "${BLUE}========================================${RESET}"
-echo
 
 if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
     CREDS_PROVIDED=true
@@ -1112,6 +1172,9 @@ fi
 
 # --------- Function to Scan a Single Port ----------
 # ---------- PORT SCAN LOOP ----------
+echo -e "\n${BLUE}========================================${RESET}"
+echo -e "${BYELLOW}        Running Port Scan     ${RESET}"
+echo -e "${BLUE}========================================${RESET}"
 for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
     while (( $(jobs -rp | wc -l) >= MAX_JOBS )); do
         sleep 0.05
@@ -1199,6 +1262,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
     # Get Cert Info
     [ "$PORT" = "636" ] && extract_ssl_info $TARGET
     [ "$PORT" = "443" ] && extract_ssl_info $TARGET
+    [ "$PORT" = "8443" ] && extract_ssl_info $TARGET
 
     if [ "$PORT" = "6379" ] && command -v redis-cli >/dev/null; then
         if redis-cli -h "$TARGET" ping 2>/dev/null | grep -qi PONG; then
@@ -1238,10 +1302,11 @@ if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
 else
     warn "No open ports detected"
 fi
+echo -e "\n${BLUE}========================================${RESET}"
 
-echo
-echo "Running Post-Scan Service Exposure Checks"
-echo "---------------------------------------------------"
+echo -e "\n${BLUE}========================================${RESET}"
+echo -e "${BYELLOW}  Post-Scan Service Exposure Checks ${RESET}"
+echo -e "${BLUE}========================================${RESET}"
 
 # --------- FTP Checks (post-scan) ----------
 if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
@@ -1749,11 +1814,8 @@ if [[ -s "$KERBEROAST_FILE" && $HAS_KERB -eq 1 && "$ENABLE_KERBROAST" == false ]
 fi
 
 # --------- Detect HTTP/HTTPS availability ----------
-HTTP_FOUND=false
-HTTPS_FOUND=false
 [ -s "$HTTP_MARKER" ] && HTTP_FOUND=true
 [ -s "$HTTPS_MARKER" ] && HTTPS_FOUND=true
-HAS_WEB=0
 if [ -s "$HTTP_MARKER" ] || [ -s "$HTTPS_MARKER" ]; then
     HAS_WEB=1
     WEB_DETECTED=true
@@ -1779,17 +1841,57 @@ for wl in \
     fi
 done
 
-#if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null && [ -f "$WORDLIST" ]; then
-if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null; then
-    
-    COMMON_FUFF_PATHS=(
+# Define common paths for the functions to use
+COMMON_FUFF_PATHS=(
       admin login dashboard uploads upload files backup old test dev dashboard
       console install health status docs init setup logout index menu data v1 v2 v3
       api api/v1 api/v2 config db include static assets images js css service vendor
       settings panel manage management home portal support services storage swagger setting
       swagger-ui docs/swagger rest build rest staging roles permissions accounts group groups
     )
-    
+COMMON_VHOSTS=(admin api dev test staging internal)
+
+# Define a regex for all ports we want to treat as "Web"
+WEB_PORT_REGEX="^(80|443|8000|8008|8080|8443|8888|9000|9443)$"
+if [[ "${#OPEN_PORTS[@]}" -gt 0 && $HAS_WEB -eq 1 ]]; then
+    WEB_DETECTED=true
+    for port in "${OPEN_PORTS[@]}"; do
+        
+        # Check if the current port in the array matches our web list
+        if [[ "$port" =~ $WEB_PORT_REGEX ]]; then
+            SCHEME=""
+
+            # Assign scheme based on the port number
+            case "$port" in
+                80|8000|8008|8080|8888|9000) 
+                    SCHEME="http" 
+                    ;;
+                443|8443|9443) 
+                    SCHEME="https" 
+                    ;;
+            esac
+
+            # If a scheme was assigned, proceed with fuzzing functions
+            if [ -n "$SCHEME" ]; then
+                WEB_DETECTED=true  # For the Recon Synopsis header
+                
+                # Call FFUF if enabled
+                if $ENABLE_WEB_ENUM && command -v ffuf >/dev/null; then
+                    run_ffuf_enum "$SCHEME" "$port" "$TARGET"
+                fi
+
+                # Call VHOST Fuzzing if enabled
+                if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && command -v curl >/dev/null; then
+                    run_vhost_fuzz "$SCHEME" "$port" "$TARGET"
+                fi
+            fi
+        fi
+    done
+fi
+
+#if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null && [ -f "$WORDLIST" ]; then
+# BROKEN CODE BLOCK | TODO FIX IT
+if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 2 ]] && command -v ffuf >/dev/null; then
     FFUF_OUT="ffuf_${TARGET}.json"
     
     echo
@@ -1798,8 +1900,10 @@ if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null; then
     # Prefer HTTPS if detected
     if [ -s "$HTTPS_MARKER" ]; then
         SCHEME="https"
+        echo "    - SCHEME: HTTPS"
     else
         SCHEME="http"
+        echo "    - SCHEME: HTTP"
     fi
     
     note "Target URL: $SCHEME://$TARGET/FUZZ"
@@ -1844,7 +1948,8 @@ if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null; then
 fi
 
 # --------- VHost Fuzzing ----------
-if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ] && command -v curl >/dev/null; then
+# BROKEN CODE BLOCK | TODO FIX IT - VHOST FUzz Crashes
+if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 2 ] && command -v curl >/dev/null; then
     echo
     echo -e "${YELLOW}[i]${RESET} Running VHost fuzzing..."
 

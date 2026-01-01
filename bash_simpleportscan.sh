@@ -46,10 +46,14 @@ DEFAULT_TARGET="127.0.0.1"
 TARGET=""
 ENABLE_VHOST=false
 ENABLE_KERB_ENUM=false
+ENABLE_WEB_ENUM=false
+ENABLE_BH_EXPORT=false
 KERBEROS_FOUND=false
 LDAP_FOUND=false
 LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
+LDAP_GUEST_BIND=false
+LDAP_AUTH_BIND=false
 LDAP_BASE_DN=""
 LDAP_DOMAIN=""
 SMB_FOUND=false
@@ -59,6 +63,8 @@ KERB_DETECTED=false
 KERB_ENUM_DONE=false
 KERB_REALM=""
 USERS_FILE=""
+DC_AUTH_OK=0
+LAPS_READABLE=false
 
 # --- Passing in User Info -----
 AUTH_USER=""
@@ -110,6 +116,8 @@ for arg in "$@"; do
         --user=*) AUTH_USER="${arg#*=}" ;;
         --pass=*) AUTH_PASS="${arg#*=}" ;;
         --domain=*) AUTH_DOMAIN="${arg#*=}" ;;
+        --web-enum) ENABLE_WEB_ENUM=true ;;
+        --run-blood) ENABLE_BH_EXPORT=true ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
@@ -182,12 +190,117 @@ notify()    { echo -e "${YELLOW}${ICON_WARN} ${RESET} $*"; }
 note()      { echo -e "${BLUE}${ICON_PIN} ${RESET} $*"; }
 finding()   { echo -e "${YELLOW}[?] ${RESET} $*"; }
 warn()      { echo -e "${RED}✖ ${RESET} $*"; }
+error()      { echo -e "${RED}[ERROR]:${RESET} $*"; }
 risk()      { echo -e "${RED}[!] ${RESET} $*"; }
 high_risk() { echo -e "${RED}${ICON_RISK} ${RESET} ${RED}$*${RESET}"; }
 critical()  { echo -e "${RED}${ICON_CRIT} ${RESET} ${RED}$*${RESET}"; }
 danger()    { echo -e "${RED}☠ ${RESET} $*"; }
 alert()     { echo -e "${RED}${ICON_ALERT} ${RESET} $*"; }
 lightbulb() { echo -e "${YELLOW}${ICON_TIP} ${RESET} $*"; }
+
+dc_auth_check() {
+    local user="$1"
+    local pass="$2"
+    local domain="$3"
+    local dc="$4"
+
+    ########################################
+    # Protocol Selection (LDAP FIRST)
+    ########################################
+    LDAP_URI="ldap://$dc"
+    # Use LDAPS only if LDAP (389) is NOT open and LDAPS (636) IS open
+    if ! grep -qx 389 "$OPEN_PORTS_FILE" 2>/dev/null \
+        && grep -qx 636 "$OPEN_PORTS_FILE" 2>/dev/null; then
+        LDAP_URI="ldaps://$dc"
+    fi
+
+    # Try a simple LDAP bind (no enumeration)
+    ldapwhoami -x \
+        -H "$LDAP_URI" \
+        -D "$user@$domain" \
+        -w "$pass" \
+        >/dev/null 2>&1
+}
+
+gather_bloodhound() {
+    info "Starting BloodHound data collection"
+    
+    if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" ]]; then
+        warn "No credentials available — skipping BloodHound collection"
+        return 1
+    fi
+
+    if [[ -z "${LDAP_DOMAIN:-}" ]]; then
+        warn "LDAP domain not identified — skipping BloodHound collection"
+        return 1
+    fi
+
+    if ! command -v bloodhound-python >/dev/null 2>&1; then
+        error "Command 'bloodhound-python' not found" 
+        return 1
+    fi
+    # Record start time
+    BH_START_TS=$(date +%s)
+    BH_OUT_DIR="bloodhound_${TARGET}"
+    if [[ -d "$BH_OUT_DIR" ]]; then
+        info "BloodHound output directory already exists: $BH_OUT_DIR"
+    else
+        mkdir -p "$BH_OUT_DIR"
+        success "Created BloodHound output directory: $BH_OUT_DIR"
+    fi
+
+    info "BloodHound parameters:"
+    echo "   - User:     $AUTH_USER"
+    echo "   - Pass:     $AUTH_PASS"
+    echo "   - Domain:   $LDAP_DOMAIN"
+    echo "   - DC:       $LDAP_DOMAIN"
+    echo "   - DC IP:    $TARGET"
+    #echo "   - Output:   $BH_OUT_DIR"
+    echo "   - ns        $TARGET"
+    echo 
+    info "Gathering domain info via Bloodhound (May Take Some Time)..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}bloodhound-python -u '$AUTH_USER' -p '$AUTH_PASS' -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET --auth-method ntlm -c All --zip ${RESET}"
+    
+    # ---- Capture output while displaying it ----
+    BH_LOG=$(mktemp)
+    
+    #bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET --auth-method ntlm -c All --zip 
+    
+    bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET --auth-method ntlm \
+        -c All \
+        --zip \
+        2>&1 | tee "$BH_LOG"
+
+
+    BH_RC=${PIPESTATUS[0]}
+
+    if [[ $BH_RC -ne 0 ]]; then
+        error "BloodHound collection failed (exit code: $BH_RC)"
+        echo
+        warn "Last BloodHound output:"
+        tail -n 15 "$BH_LOG" | sed 's/^/   /'
+        rm -f "$BH_LOG"
+        return 1
+    fi
+
+    success "BloodHound data collected successfully!"
+
+    ZIP_FILE=$(
+        find . -maxdepth 1 -name '*_bloodhound.zip' -type f \
+            -newermt "@$BH_START_TS" \
+            -printf '%T@ %p\n' \
+            | sort -nr \
+            | awk 'NR==1 {print $2}'
+    )
+
+    if [[ -n "$ZIP_FILE" ]]; then
+        info "Upload this file to BloodHound:"
+        echo -e "   ${BYELLOW}${ZIP_FILE#./}${RESET}"
+    else
+        warn "No BloodHound ZIP file found from this run"
+    fi
+}
 
 # --------- SSL Certificate Extraction ----------
 extract_ssl_info() {
@@ -333,6 +446,7 @@ ldap_enum() {
 
     echo
     info "LDAP detected — starting safe LDAP enumeration"
+    echo "    Passed Domain:    $PASSED_DOMAIN"
 
     ########################################
     # 1. Protocol Selection (LDAP FIRST)
@@ -350,11 +464,15 @@ ldap_enum() {
     # 2. Bind Arguments
     ########################################
     LDAP_BIND_ARGS="-x"
-
     if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
-        info "Using authenticated LDAP bind"
-        LDAP_BIND_ARGS="-x -D ${AUTH_DOMAIN:+$AUTH_DOMAIN\\}$AUTH_USER -w $AUTH_PASS"
+        info "Using authenticated LDAP bind (UPN format)"
+        #LDAP_BIND_ARGS="-x -D '${AUTH_USER}@${PASSED_DOMAIN}' -w '$AUTH_PASS'"
+        LDAP_BIND_ARGS=(-x -D "${AUTH_USER}@${PASSED_DOMAIN}" -w "$AUTH_PASS")
     fi
+    #if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
+    #    info "Using authenticated LDAP bind"
+    #    LDAP_BIND_ARGS="-x -D '${PASSED_DOMAIN}\\$AUTH_USER' -w '$AUTH_PASS'"
+    #fi
 
     ########################################
     # 3. Base DN Resolution (STATE-AWARE)
@@ -416,9 +534,13 @@ ldap_enum() {
     ########################################
     if [[ "$USE_AUTH" != "auth" ]]; then
         info "Testing anonymous LDAP bind"
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}ldapsearch -x -H '$LDAP_URI' -b $LDAP_BASE_DN -s base '(objectClass=*)'${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET -u '' -p ''${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET -d $LDAP_BASE_DN --anonymous${RESET}"
 
-        ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" -s base "(objectClass=*)" \
-            >/dev/null 2>&1
+
+        ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" -s base "(objectClass=*)" >/dev/null 2>&1
 
         if [[ $? -ne 0 ]]; then
             notify "Anonymous LDAP bind not permitted"
@@ -429,46 +551,108 @@ ldap_enum() {
         critical "Anonymous LDAP bind allowed"
         LDAP_ANON_BIND=true
     fi
+    ########################################
+    # 5b. Guest Bind Test (Only if 'anon' is passed)
+    ########################################
+    if [[ "$USE_AUTH" != "auth" ]]; then
+	info "Testing LDAP Guest bind (${LDAP_DOMAIN}\\Guest)"
+
+	echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+	echo -e "        ${GREEN}ldapsearch -x -H '$LDAP_URI' -D '${LDAP_DOMAIN}\\Guest' -w '' -b '$LDAP_BASE_DN' -s base '(objectClass=*)'${RESET}"
+	echo -e "        ${GREEN}netexec ldap $TARGET -d $LDAP_DOMAIN -u Guest -p ''${RESET}"
+
+	ldapsearch -x \
+	    -H "$LDAP_URI" \
+	    -D "${LDAP_DOMAIN}\\Guest" \
+	    -w '' \
+	    -b "$LDAP_BASE_DN" \
+	    -s base "(objectClass=*)" \
+	>/dev/null 2>&1
+
+	if [[ $? -eq 0 ]]; then
+		critical "LDAP Guest bind allowed (DOMAIN\\Guest)"
+		LDAP_GUEST_BIND=true
+
+		# Prefer Guest over anonymous for enumeration
+		LDAP_BIND_ARGS=(-x -D "${LDAP_DOMAIN}\\Guest" -w "")
+	    else 
+	    warn "LDAP Guest bind not permitted"
+	fi
+    fi
 
     ########################################
     # 6. Enumeration (Read-Only)
     ########################################
 
-    info "Enumerating domain password policy"
-    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(objectClass=domainDNS)" \
-        minPwdLength lockoutThreshold maxPwdAge 2>/dev/null \
-        | sed 's/^/    /'
+    info "Enumerating domain password policy..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=domainDNS)' minPwdLength lockoutThreshold maxPwdAge${RESET}"
+    ldapsearch $LDAP_BIND_ARGS -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=domainDNS)' minPwdLength lockoutThreshold maxPwdAge 2>/dev/null | sed 's/^/    /'
+    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=domainDNS)' minPwdLength lockoutThreshold maxPwdAge 2>/dev/null | sed 's/^/    /'
+    
 
-    info "Enumerating users"
-    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(&(objectClass=user)(!(objectClass=computer)))" \
-        sAMAccountName userPrincipalName 2>/dev/null \
-        | awk '/^sAMAccountName:/ {print "    - "$2}'
+    info "Enumerating users..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=user)(!(objectClass=computer)))' sAMAccountName userPrincipalName${RESET}"
+    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=user)(!(objectClass=computer)))' sAMAccountName userPrincipalName 2>/dev/null | awk '/^sAMAccountName:/ {print "    - "$2}'
+    
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    #USERS_FILE="users_${TARGET}_${DATE_TAG}.txt"
+    LDAP_USERS_TMP="users_${TARGET}_${DATE_TAG}.txt"
 
-    info "Enumerating groups"
-    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(objectClass=group)" cn 2>/dev/null \
-        | awk '/^cn:/ {print "    - "$2}'
+    ldapsearch ${LDAP_BIND_ARGS[@]} -H "$LDAP_URI" -b "$LDAP_BASE_DN" "(&(objectClass=user)(!(objectClass=computer)))" sAMAccountName 2>/dev/null \
+    | awk '/^sAMAccountName:/ { print $2 }' \
+    | sort -u > "$LDAP_USERS_TMP"
+    ########################################
+    ##    Set USERS_FILE from LDAP enum (if unset)
+    ########################################
+    if [[ -z "${USERS_FILE:-}" ]]; then
+        if [[ -s "$LDAP_USERS_TMP" ]]; then
+            USERS_FILE="$LDAP_USERS_TMP"
+            export USERS_FILE
+            success "Users were found! Users were written to: ${BLUE}$USERS_FILE${RESET}"
+        else
+            notify "LDAP user enumeration returned no users — 'USERS_FILE' not set"
+        fi
+    else
+        info "Users were already found and set — preserving existing values: ${BLUE}$USERS_FILE${RESET}"
+    fi
 
-    info "Enumerating computers"
-    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(objectClass=computer)" dNSHostName 2>/dev/null \
-        | awk '/^dNSHostName:/ {print "    - "$2}'
+    info "Enumerating groups..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=group)' cn${RESET}"
+    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=group)' cn 2>/dev/null | awk '/^cn:/ {print "    - "$2}'
+
+    info "Enumerating computers..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=computer))' dNSHostName${RESET}"
+    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN "(&(objectClass=computer))" dNSHostName 2>/dev/null | awk '/^dNSHostName:/ {print "    - "$2}'
 
     ########################################
     # 7. High-Impact Checks
     ########################################
 
-    info "Checking for LAPS exposure"
-    if ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(ms-MCS-AdmPwd=*)" ms-MCS-AdmPwdExpirationTime 2>/dev/null \
-        | grep -q ms-MCS-AdmPwd; then
-        critical "LAPS attributes readable (HIGH RISK)"
+    info "Checking for LAPS exposure..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(ms-MCS-AdmPwd=*)' ms-MCS-AdmPwdExpirationTime${RESET}"
+    LAPS_OUTPUT=$(ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+        "(ms-MCS-AdmPwd=*)" ms-MCS-AdmPwd ms-MCS-AdmPwdExpirationTime 2>/dev/null)
+    if echo "$LAPS_OUTPUT" | grep -Eq '^dn: '; then
+        critical "LAPS password attribute readable (HIGH RISK)"
+
+        echo
+        warn "Exposed LAPS attributes:"
+        echo "$LAPS_OUTPUT" | sed 's/^/    /'
+        LAPS_READABLE=true
+    else
+        info "LAPS password attribute not readable"
     fi
 
-    info "Searching for Kerberos SPNs"
-    ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+
+    info "Searching for Kerberos SPNs..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(servicePrincipalName=*)' sAMAccountName servicePrincipalName${RESET}"
+    ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(servicePrincipalName=*)" sAMAccountName servicePrincipalName 2>/dev/null \
         | awk '/^sAMAccountName:/ {print "    - "$2}'
 
@@ -490,8 +674,8 @@ ldap_enum() {
         critical "Authenticated LDAP access confirmed"
 
         info "Enumerating all domain users (authenticated)"
-
-        ldapsearch $LDAP_BIND_ARGS -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+        echo "    ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=user)(!(objectClass=computer)))' sAMAccountName memberOf userPrincipalName"
+        ldapsearch ${LDAP_BIND_ARGS[@]} -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
             "(&(objectClass=user)(!(objectClass=computer)))" \
             sAMAccountName memberOf userPrincipalName 2>/dev/null \
         | awk '
@@ -500,6 +684,16 @@ ldap_enum() {
                 print "    - " user
             }
         '
+        
+        ldapsearch ${LDAP_BIND_ARGS[@]} -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
+            "(&(objectClass=user)(!(objectClass=computer)))" \
+            sAMAccountName memberOf userPrincipalName 2>&1
+        if [[ $? -eq 0 ]]; then
+            LDAP_AUTH_BIND=true
+            critical "Authenticated LDAP Access Confirmed! ${AUTH_USER}|${AUTH_PASS}"
+        else
+            warn "Authenticated LDAP bind failed"
+        fi
     fi
 
     LDAP_ENUM_DONE=true
@@ -578,12 +772,10 @@ kerberos_enum_users() {
     if [[ -z "${USERS_FILE:-}" ]]; then
         notify "USERS_FILE variable not set — skipping AS-REP roasting"
         USERFILE_OK=false
-    fi
-    if [[ ! -f "$USERS_FILE" ]]; then
+    elif [[ ! -f "$USERS_FILE" ]]; then
         notify "USERS_FILE does not exist ($USERS_FILE) — skipping AS-REP roasting"
         USERFILE_OK=false
-    fi
-    if [[ ! -s "$USERS_FILE" ]]; then
+    elif [[ ! -s "$USERS_FILE" ]]; then
         notify "USERS_FILE exists but is empty — skipping AS-REP roasting"
         USERFILE_OK=false
     fi
@@ -733,6 +925,50 @@ kerberos_enum_users() {
     fi
 
     KERB_ENUM_DONE=true
+}
+
+ftp_auth_check() {
+    local target="$1"
+    local user="$2"
+    local pass="$3"
+
+    command -v netexec >/dev/null 2>&1 || {
+        warn "netexec not installed — skipping authenticated FTP check"
+        return
+    }
+
+    info "Attempting authenticated FTP login (netexec)"
+
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}netexec ftp $target -u '$user' -p '$pass'${RESET}"
+
+    FTP_OUT=$(timeout 8 netexec ftp "$target" -u "$user" -p "$pass" 2>&1)
+
+    # --- SUCCESS ---
+    # netexec success indicators:
+    #   [+] Login successful
+    #   [+] <user>:<pass>
+    if echo "$FTP_OUT" | grep -qiE '\[\+\].*(Login successful|'"$user"':'"$pass"')'; then
+        critical "FTP authentication successful → $user:$pass"
+        echo "[LOOT] FTP AUTH $target $user:$pass" >> ftp_valid_creds.txt
+        return 
+    fi
+
+    # --- EXPLICIT FAILURE ---
+    if echo "$FTP_OUT" | grep -qiE 'authentication failed|login failed|530'; then
+        notify "FTP authentication failed for $user"
+        return 
+    fi
+
+    # --- SERVICE PRESENT BUT RESULT UNCLEAR ---
+    if echo "$FTP_OUT" | grep -qiE 'ftp.*open|connected'; then
+        notify "FTP reachable, but authentication result unclear"
+        return 
+    fi
+
+    # --- HARD FAILURE ---
+    warn "FTP authentication check failed (no valid response)"
+    return 
 }
 
 # --------- Ports ----------
@@ -970,13 +1206,13 @@ echo
 echo "Running Post-Scan Service Exposure Checks"
 echo "---------------------------------------------------"
 
-
-# --------- FTP Anonymous Check (post-scan) ----------
+# --------- FTP Checks (post-scan) ----------
 if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
-    if command -v ftp >/dev/null; then
-        echo
-        info "FTP detected — checking anonymous access"
+    echo
+    info "FTP detected — running checks"
 
+    # --- Anonymous check ---
+    if command -v ftp >/dev/null; then
         if echo -e "user anonymous\npass anonymous\nquit" \
             | timeout 5 ftp -n "$TARGET" 2>/dev/null \
             | grep -qi "^230"; then
@@ -985,10 +1221,16 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
         else
             notify "Anonymous FTP login not permitted"
         fi
+    fi
+
+    # --- Authenticated check (only if creds provided) ---
+    if $CREDS_PROVIDED; then
+        ftp_auth_check "$TARGET" "$AUTH_USER" "$AUTH_PASS"
     else
-        warn "FTP client not installed — skipping anonymous FTP check"
+        note "No credentials provided — skipping authenticated FTP check"
     fi
 fi
+
 
 # --------- SMB Enumeration (only if 139 or 445 is open) ----------
 SMB_NULL_OK=false
@@ -1214,15 +1456,12 @@ if [ -s "$SMB_MARKER" ]; then
         if $SMB_NULL_OK; then
             cme_enum_users "NULL session" "" || true
         fi
-
         if $SMB_GUEST_OK; then
             cme_enum_users "GUEST" "-u guest -p ''" || true
         fi
-        
         if $CREDS_PROVIDED; then 
             cme_enum_users "AUTHENTICATED" "-u $AUTH_USER -p $AUTH_PASS" || true
         fi
-         
     fi
 
     # -------- CME RID Brute (CRITICAL if Guest allowed) --------
@@ -1264,9 +1503,13 @@ if [ -s "$SMB_MARKER" ]; then
         fi
     fi
 
-    # -------- No Shares Found Case --------
+    # -------- No Shares Found --------
     if ! $SMB_ENUM_SUCCESS; then
-        info "No SMB Shares Detected. Maybe retry with user creds?"
+        if $CREDS_PROVIDED; then
+            info "No SMB Shares Detected. Maybe retry with different user creds?"
+        else
+            info "No SMB Shares Detected. Maybe retry with user creds?"
+        fi
     fi
 fi
 
@@ -1277,7 +1520,32 @@ if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
 
     echo "LDAP_ENUM With Creds"
     $CREDS_PROVIDED && ldap_enum auth "${AUTH_DOMAIN:-$LDAP_DOMAIN}"
+    
+    if $LDAP_AUTH_BIND; then
+        high_risk "LDAP Exposure Level: Directory is Accessible with known/compromised credentials"
+    fi
+    if $LDAP_GUEST_BIND; then
+        high_risk "LDAP Exposure Level: Guest-Accessible Directory"
+    fi
+    if $LDAP_ANON_BIND; then
+        high_risk "LDAP Exposure Level: Anonymous Directory Access"
+    fi
 fi
+
+# Verify Creds can Access Domain Controller
+if  $CREDS_PROVIDED && [ $HAS_LDAP -eq 1 ]  ; then
+    if dc_auth_check "$AUTH_USER" "$AUTH_PASS" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$TARGET"; then
+        echo
+        success "${GREEN}Credentials successfully authenticated to Domain Controller!${RESET}"
+        echo
+        DC_AUTH_OK=1
+    else
+        echo
+        warn "${RED}Credentials failed to authenticate to Domain Controller.${RESET}"
+        echo
+    fi
+fi
+
 
 # --------- Kerberos Post-Scan Handling ----------
 if [ -s "$KERB_MARKER" ]; then
@@ -1317,10 +1585,12 @@ if $CREDS_PROVIDED; then
        info "Trying WinRM:"
        lightbulb "    ${YELLOW}Copy/Paste:${RESET}"
              echo -e "        ${GREEN}crackmapexec winrm $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+             echo -e "        ${GREEN}netexec winrm $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
        
        if crackmapexec winrm "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
                 | grep -qP 'WINRM\s+\S+\s+\d+\s+\S+\s+\[\+\]'; then
-            critical "WinRM credential reuse confirmed"
+            critical "WinRM Credential Access Confirmed!"
+            echo -e "        ${GREEN}evil-winrm -i ${AUTH_DOMAIN:-$LDAP_DOMAIN} -u $AUTH_USER -p '$AUTH_PASS'${RESET}"
         else
             warn "WinRM authentication failed or not permitted"
         fi
@@ -1335,6 +1605,7 @@ if $CREDS_PROVIDED; then
        lightbulb "Trying MSSQL:"
        lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
              echo -e "        ${GREEN}crackmapexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+             echo -e "        ${GREEN}netexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
        
        if crackmapexec mssql "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
             | grep -qi success; then
@@ -1350,7 +1621,7 @@ if [[ -s "$KERB_MARKER" && "$ENABLE_KERB_ENUM" == false ]]; then
     echo
     alert "${BLUE}Tip:${RESET} Kerberos detected"
     echo "  ----------------------------"
-    echo "    Re-run with --kerb-enum to attempt safe user enumeration"
+    echo -e "    Re-run with ${BLUE}--kerb-enum${RESET} to attempt safe user enumeration"
     echo "    Example:"
     echo "      ./bash_simpleportscan.sh $TARGET --kerb-enum"
 fi
@@ -1364,13 +1635,93 @@ HAS_WEB=0
 if [ -s "$HTTP_MARKER" ] || [ -s "$HTTPS_MARKER" ]; then
     HAS_WEB=1
 fi
-rm -f "$HTTP_MARKER" "$HTTPS_MARKER"
 
 # --------- Merge redirect hosts ----------
 [ -s "$REDIRECT_HOSTS" ] && sort -u "$REDIRECT_HOSTS" >> "$DISCOVERED_HOSTS"
 
+# -------- Run Fuff/Dirbuster (Web Directory Enumeration) ---------   
+if [[ $HAS_WEB -eq 1 ]] && ! $ENABLE_WEB_ENUM; then
+    echo
+    alert "${BLUE}Tip:${RESET} Web Service Detected"
+    info "    — add ${BLUE}--web-enum${RESET} to enable directory enumeration"
+    echo
+fi
+ 
+for wl in \
+    /usr/share/wordlists/dirb/common.txt \
+    /usr/share/seclists/Discovery/Web-Content/common.txt; do
+    if [ -f "$wl" ]; then
+        WORDLIST="$wl"
+        break
+    fi
+done
+
+#if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null && [ -f "$WORDLIST" ]; then
+if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 1 ]] && command -v ffuf >/dev/null; then
+    
+    COMMON_FUFF_PATHS=(
+      admin login dashboard uploads upload files backup old test dev dashboard
+      console install health status docs init setup logout index menu data v1 v2 v3
+      api api/v1 api/v2 config db include static assets images js css service vendor
+      settings panel manage management home portal support services storage swagger setting
+      swagger-ui docs/swagger rest build rest staging roles permissions accounts group groups
+    )
+    
+    FFUF_OUT="ffuf_${TARGET}.json"
+    
+    echo
+    info "Running directory enumeration with ffuf"
+
+    # Prefer HTTPS if detected
+    if [ -s "$HTTPS_MARKER" ]; then
+        SCHEME="https"
+    else
+        SCHEME="http"
+    fi
+    
+    note "Target URL: $SCHEME://$TARGET/FUZZ"
+    echo "   ffuf -u $SCHEME://$TARGET/FUZZ -w [wordlist] -mc 200,204,301,302,307,401,403 -fc 404 -t 50 -timeout 5 -o $FFUF_OUT -of json"
+    note " Try with a Larger WordList ($WORDLIST)..."
+        
+    # ---- Run ffuf with inline wordlist ----
+    FFUF_WORDLIST=$(mktemp)
+    # Original paths
+    printf "%s\n" "${COMMON_FUFF_PATHS[@]}" > "$FFUF_WORDLIST"
+    # PHP variants
+    printf "%s\n" "${COMMON_FUFF_PATHS[@]/%/.php}" > "$FFUF_WORDLIST"
+    
+    ffuf -u "$SCHEME://$TARGET/FUZZ" -w $FFUF_WORDLIST \
+        -mc 200,204,301,302,307,401,403 \
+        -fc 404 \
+        -t 50 \
+        -timeout 5 \
+        -o "$FFUF_OUT" \
+        -of json
+
+    # Wordlist is no longer needed.
+    rm -f "$FFUF_WORDLIST"
+
+    if [ -s "$FFUF_OUT" ]; then
+        success "ffuf completed — results saved to $FFUF_OUT"
+        # Extract interesting paths (jq required)
+        if command -v jq >/dev/null; then
+            jq -r '.results[].url' "$FFUF_OUT" \
+            | sed "s|$SCHEME://$TARGET||" \
+            | sort -u \
+            | while read -r path; do
+                echo "    - $path"
+            done
+        else
+            warn "jq not found — raw ffuf JSON output available"
+        fi
+    else
+        warn "ffuf ran but produced no results"
+    fi
+    echo
+fi
+
 # --------- VHost Fuzzing ----------
-if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && command -v curl >/dev/null; then
+if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ] && command -v curl >/dev/null; then
     echo
     echo -e "${YELLOW}[i]${RESET} Running VHost fuzzing..."
 
@@ -1392,6 +1743,15 @@ if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && command -v curl >/dev/null; th
             fi
         done
     done
+elif $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ]; then
+    echo
+    warn "Unable to VHOST FUZZ - 'curl' command is not available"
+    echo
+elif ! $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ] && command -v curl >/dev/null; then
+    echo
+    alert "${BLUE}Tip:${RESET} Web Service detected and Hosts were discovered"
+    info "    — add ${BLUE}--vhost${RESET} to enable vhost fuzzing"
+    echo
 fi
 
 # ---------- /etc/hosts suggestions ----------
@@ -1427,6 +1787,18 @@ if [ -s "$HOSTS_FILE" ]; then
     fi
 fi
 
+# Attempt to run Bloodhound
+if [[ $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 && $DC_AUTH_OK -eq 1 ]]; then
+   if [[ "$ENABLE_BH_EXPORT" == "true" ]]; then
+       gather_bloodhound
+   else
+      echo
+      alert "${BLUE}Tip:${RESET} LDAP, KERB, & DC Authorized Access detected"
+      info "    — add ${BLUE}--run-blood${RESET} to enable auto bloodhound export"
+      echo
+   fi
+fi
+
 # --------- Recon Summary & Next Steps ----------
 echo
 echo -e "${BLUE}============================${RESET}"
@@ -1441,6 +1813,7 @@ if [[ $HAS_SMB -eq 1 && $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 ]]; then
     echo "    → SMB share creds"
     echo "    → WinRM / RDP"
     echo "    → User / Password Spray"
+    echo "    → Bloodhound"
     echo
 elif [[ $HAS_SMB -eq 1 ]]; then
     alert "ATTACK SURFACE: FILE SHARES / WINDOWS HOST"
@@ -1559,14 +1932,11 @@ EOF
 done
 
 # --------- Cleanup ----------
-rm -f "$HINT_FILE" "$HOSTS_FILE" "$DISCOVERED_HOSTS" "$REDIRECT_HOSTS" "$KERB_MARKER"
+rm -f "$HINT_FILE" "$HOSTS_FILE" "$DISCOVERED_HOSTS" "$REDIRECT_HOSTS" "$KERB_MARKER" "$HTTP_MARKER" "$HTTPS_MARKER"
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
-
 echo
 success "Scan completed in ${DURATION}s"
-
 echo
 echo "Scan complete."
-

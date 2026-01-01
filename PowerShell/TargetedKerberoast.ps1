@@ -335,13 +335,13 @@ if($SPN_Set)
         {
             write-host "Command: "
             Write-host "   Get-DomainSPNTicket -SPN $TempSPN -Credential '$$Cred' -OutputFormat $OutputFormat"
-            $Ticket = Get-DomainSPNTicket -SPN "$TempSPN" -Credential $Cred -OutputFormat $OutputFormat  
+            $Ticket = Get-DomainSPNTicket -SPN "$TempSPN" -Credential $Cred #-OutputFormat $OutputFormat 
         }
         else
         {
             write-host "Command: "
             Write-host "   Get-DomainSPNTicket -SPN $TempSPN -OutputFormat $OutputFormat"
-            $Ticket = Get-DomainSPNTicket -SPN "$TempSPN" -OutputFormat $OutputFormat 
+            $Ticket = Get-DomainSPNTicket -SPN "$TempSPN" #-OutputFormat $OutputFormat 
 
             #Get-DomainSPNTicket -User $targetUserIden -OutputFormat $OutputFormat | fl
             #Get-DomainUser -SPN $TempSPN | Get-DomainSPNTicket -OutputFormat Hashcat

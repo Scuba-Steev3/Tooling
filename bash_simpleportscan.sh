@@ -49,6 +49,7 @@ ENABLE_BH_EXPORT=false
 ENABLE_KERBROAST=false
 KERBEROS_FOUND=false
 LDAP_FOUND=false
+LDAP_BIND_TYPE=""
 LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
 LDAP_GUEST_BIND=false
@@ -84,6 +85,7 @@ ADCS_SERVICE_DETECTED=false
 MACHINE_ACCOUNT_QUOTA=-1
 CAN_JOIN_COMPUTERS_TO_DOMAIN=false
 HAS_WRITABLE_COMPUTER_ACL=false
+MAQ_ENABLED=false
 
 # --------- Certificate Services / AD CS ----------
 HAS_CERTIPY=0
@@ -2091,7 +2093,7 @@ done
 
 # Define common paths for the functions to use
 COMMON_FUFF_PATHS=(
-      admin login dashboard uploads upload files backup old test dev dashboard
+      .env admin login dashboard uploads upload files backup old test dev dashboard contact
       console install health status docs init setup logout index menu data v1 v2 v3
       api api/v1 api/v2 config db include static assets images js css service vendor
       settings panel manage management home portal support services storage swagger setting
@@ -2221,7 +2223,7 @@ if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 2 ] && command 
     done
 elif $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ]; then
     echo
-    warn "Unable to VHOST FUZZ - 'curl' command is not available"
+    warn "Unable to VHOST FUZZ - 'curl' command is not available or VHOST CODE BLOCK IS STILL BROKEN"
     echo
 elif ! $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ] && command -v curl >/dev/null; then
     echo
@@ -2373,6 +2375,7 @@ generate_synopsis
 # Attack Path Decision Engine
 ########################################
 attack_path_evaluation() {
+	ATTACK_PATHS=()  #Initialize to avoid unbound variable error
     echo -e "\n${BLUE}========================================${RESET}"
     echo -e "${BYELLOW}    Attack Path Decision Engine        ${RESET}"
     echo -e "${BLUE}========================================${RESET}"

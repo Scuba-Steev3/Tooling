@@ -61,6 +61,11 @@ SMB_AUTH_OK=false
 LDAP_BASE_DN=""
 LDAP_DOMAIN=""
 LDAP_BIND_TYPE=""
+RPC_ANON_OK=false
+RPC_GUEST_OK=false
+RPC_AUTH_OK=false
+MSRPC_ANON_OK=false
+RPC_ATTACK_MAP_FOUND=false
 SMB_FOUND=false
 SMB_ENUM_DONE=false
 NO_COLOR=false
@@ -1276,6 +1281,114 @@ check_psexec_access() {
     echo "$PSEXEC_OUTPUT"
 }
 
+# --------- RPC Checks ----------
+declare -A RPC_UUID_ATTACKS=(
+    ["c681d488-d850-11d0-8c52-00c04fd90f7e"]="MS-EFSRPC (PetitPotam / NTLM coercion)"
+    ["12345778-1234-abcd-ef00-0123456789ac"]="LSARPC (policy / SID enumeration)"
+    ["367abb81-9844-35f1-ad32-98f038001003"]="WMI (DCOM remote execution surface)"
+    ["8d9f4e40-a03d-11ce-8f69-08003e30051b"]="DCOM IObjectExporter (lateral movement)"
+    ["6bffd098-a112-3610-9833-012892020162"]="NETLOGON (MS-NRPC / relay / Zerologon-class)"
+    ["4b324fc8-1670-01d3-1278-5a47bf6ee188"]="SRVSVC (SMB share & host enumeration)"
+    ["e3514235-4b06-11d1-ab04-00c04fc2dcd2"]="Active Directory RPC (BloodHound surface)"
+)
+
+parse_rpcdump_and_map_attacks() {
+    local target="$1"
+    local dump_file="rpcdump_${target}_anon.txt"
+
+    [[ ! -f "$dump_file" ]] && return
+
+    info "Parsing MSRPC UUIDs and mapping to known attack paths"
+
+    FOUND_RPC_ATTACKS=()
+
+    while IFS= read -r uuid; do
+        attack="${RPC_UUID_ATTACKS[$uuid]}"
+        if [[ -n "$attack" ]]; then
+            FOUND_RPC_ATTACKS+=("$uuid → $attack")
+        fi
+    done < <(grep -oE '[a-f0-9-]{36}' "$dump_file" | sort -u)
+
+    if [[ ${#FOUND_RPC_ATTACKS[@]} -gt 0 ]]; then
+        RPC_ATTACK_MAP_FOUND=true
+
+        echo "${FOUND_RPC_ATTACKS[@]}" > "rpc_attackmap_${target}.txt"
+
+        critical "Known RPC attack paths identified"
+        for a in "${FOUND_RPC_ATTACKS[@]}"; do
+            echo "   - $a"
+        done
+
+        success "Saved RPC attack map → rpc_attackmap_${target}.txt"
+    else
+        note "No known exploitable RPC UUIDs detected"
+    fi
+}
+
+check_rpc_services() {
+    local target="$1"
+
+    # ------------------------------
+    # 1. Anonymous MSRPC via rpcdump.py
+    # ------------------------------
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "135"; then
+        if command -v rpcdump.py >/dev/null; then
+            info "Enumerating MSRPC endpoints on $target with rpcdump.py (anonymous)"
+            output=$(rpcdump.py @"$target" 2>&1)
+            echo "$output" > "rpcdump_${target}_anon.txt"
+
+            if echo "$output" | grep -q "UUID"; then
+                critical "Anonymous MSRPC enumeration successful!"
+                MSRPC_ANON_OK=true
+		parse_rpcdump_and_map_attacks "$target"
+            else
+                warn "Anonymous MSRPC enumeration failed"
+                MSRPC_ANON_OK=false
+            fi
+        fi
+    fi
+
+    # ------------------------------
+    # 2. SMB RPC via rpcclient (anonymous and guest)
+    # ------------------------------
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -q -E '^445$|^139$'; then
+        if command -v rpcclient >/dev/null; then
+            info "Testing anonymous SMB RPC (rpcclient -U \"\")"
+            if echo "exit" | rpcclient -U "" "$target" 2>&1 | grep -vq "NT_STATUS_LOGON_FAILURE"; then
+                critical "Anonymous SMB RPC login successful!"
+                RPC_ANON_OK=true
+            else
+                warn "Anonymous SMB RPC login failed"
+                RPC_ANON_OK=false
+            fi
+
+            info "Testing guest SMB RPC (rpcclient -U guest%)"
+            if echo "exit" | rpcclient -U "guest%" "$target" 2>&1 | grep -vq "NT_STATUS_LOGON_FAILURE"; then
+                critical "Guest SMB RPC login successful!"
+                RPC_GUEST_OK=true
+            else
+                warn "Guest SMB RPC login failed"
+                RPC_GUEST_OK=false
+            fi
+        fi
+    fi
+
+    # ------------------------------
+    # 3. Authenticated MSRPC (rpcclient) if creds provided
+    # ------------------------------
+    if $CREDS_PROVIDED && command -v rpcclient >/dev/null; then
+        info "Testing authenticated SMB RPC (rpcclient -U $AUTH_USER%)"
+        if echo "exit" | rpcclient -U "$AUTH_USER%$AUTH_PASS" "$target" 2>&1 | grep -vq "NT_STATUS_LOGON_FAILURE"; then
+            critical "Authenticated SMB RPC login successful!"
+            RPC_AUTH_OK=true
+        else
+            warn "Authenticated SMB RPC login failed"
+            RPC_AUTH_OK=false
+        fi
+    fi
+}
+
+
 
 # --------- Ports ----------
 PORTS=(
@@ -1542,6 +1655,8 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
     fi
 fi
 
+# --------- Debug / Visibility ----------
+check_rpc_services "$TARGET"
 
 # --------- SMB Enumeration (only if 139 or 445 is open) ----------
 if [ -s "$SMB_MARKER" ]; then
@@ -2496,13 +2611,22 @@ generate_synopsis() {
     fi
     
     # 2. Remote Management
-    if [ "$WINRM_DETECTED" = true ] || [ "$SSH_DETECTED" = true ] || [ "$WMI_AUTH_OK" = true ] || [ "$PSEXEC_AUTH_OK" = true ]; then
+    if [ "$WINRM_DETECTED" = true ] || [ "$SSH_DETECTED" = true ] || [ "$WMI_AUTH_OK" = true ] || [ "$PSEXEC_AUTH_OK" = true ] || [ "$RPC_ANON_OK" = true ] || [ "$RPC_GUEST_OK" = true ] || [ "$RPC_AUTH_OK" = true ]; then
         echo -e "\n ${CYAN}REMOTE MANAGEMENT SERVICES${RESET}"
         echo -e " --------------------------------------"
         print_item "$WINRM_DETECTED" "WinRM Service is Open and Access is Allowed (Possible Lateral Movement)"
         print_item "$WMI_AUTH_OK" "WMI is Open and Access is Allowed (Possible Lateral Movement)"
         print_item "$PSEXEC_AUTH_OK" "PSExec Access is Allowed (Possible Lateral Movement)"
         #print_item "$SSH_DETECTED" "SSH Service is Open (Check for password/key reuse)"
+    
+        print_item "$RPC_ANON_OK" "Anonymous RPC client access detected"
+        print_item "$RPC_GUEST_OK" "Guest RPC client access detected"
+        print_item "$RPC_AUTH_OK" "Authenticated RPC client access detected"
+        print_item "$MSRPC_ANON_OK" "Anonymous MSRPC (rpcdump) access detected"
+        if $RPC_ATTACK_MAP_FOUND; then
+            print_item "$RPC_ATTACK_MAP_FOUND" "RPC-based attack paths identified:"
+            cat "rpc_attackmap_${TARGET}.txt" | sed 's/^/   - /'
+        fi
     fi
 
     # 3. File Services

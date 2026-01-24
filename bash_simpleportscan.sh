@@ -42,12 +42,14 @@ START_TIME=$(date +%s)
 
 DEFAULT_TARGET="127.0.0.1"
 TARGET=""
+DOMAIN_CONTROLLER=""
 ENABLE_VHOST=false
 ENABLE_KERB_ENUM=false
 ENABLE_WEB_ENUM=false
 ENABLE_BH_EXPORT=false
 ENABLE_KERBROAST=false
 KERBEROS_FOUND=false
+NTLM_ENABLED=false
 LDAP_FOUND=false
 LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
@@ -68,6 +70,10 @@ MSRPC_ANON_OK=false
 RPC_ATTACK_MAP_FOUND=false
 SMB_FOUND=false
 SMB_ENUM_DONE=false
+SMB_V1=false
+SMB_V2=false
+SMB_V3=false
+SMB_SIGNING=false
 NO_COLOR=false
 KERBEROAST_FILE=""
 KERBEROAST_OUT=""
@@ -238,6 +244,32 @@ danger()    { echo -e "${RED}☠ ${RESET} $*"; }
 alert()     { echo -e "${RED}${ICON_ALERT} ${RESET} $*"; }
 lightbulb() { echo -e "${YELLOW}${ICON_TIP} ${RESET} $*"; }
 
+ORIGINAL_HOSTNAME=""
+resolve_hostname_to_ip() {
+    local input="$1"
+    local resolved_ip
+
+    # If it's already an IP, return
+    if [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+
+    # Try to resolve the hostname
+    resolved_ip=$(getent hosts "$input" | awk '{ print $1 }')
+
+    if [ -z "$resolved_ip" ]; then
+        error "Could not resolve hostname: $input"
+        exit 1
+    fi
+
+    info "Resolved hostname ${CYAN}$input${RESET} to IP: ${GREEN}$resolved_ip${RESET}"
+
+    # Save original hostname for Kerberos/SPN logic if needed
+    ORIGINAL_HOSTNAME="$input"
+    TARGET="$resolved_ip"
+}
+
+
 dc_auth_check() {
     local user="$1"
     local pass="$2"
@@ -360,32 +392,105 @@ gather_bloodhound() {
 
 # --------- SSL Certificate Extraction ----------
 extract_ssl_info() {
-    local host="$1"
-    command -v openssl >/dev/null 2>&1 || return
+    local HOST=$1
+    local PORT=${2:-443}
 
-    cert=$(timeout 4 openssl s_client -connect "$host:443" -servername "$host" </dev/null 2>/dev/null)
-    [ -z "$cert" ] && return
+    info "Extracting SSL certificate from $HOST:$PORT..."
 
-    cn=$(echo "$cert" | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*CN=//p')
-    sans=$(echo "$cert" | openssl x509 -noout -ext subjectAltName 2>/dev/null \
-        | sed -n 's/.*DNS://p' | tr ',' '\n' | sed 's/^[[:space:]]*//')
+    # Retrieve the SSL certificate
+    SSL_INFO=$(timeout 4 openssl s_client -connect "$HOST:$PORT" -showcerts </dev/null 2>/dev/null)
 
-    [ -n "$cn" ] && {
-        finding "SSL CN: $cn"
-        echo "$TARGET $cn" >> "$HOSTS_FILE"
-        echo "$cn" >> "$DISCOVERED_HOSTS"
+    if [ -z "$SSL_INFO" ]; then
+        warn "Could not retrieve SSL certificate from $HOST:$PORT"
+        return
+    fi
+
+    # Extract SANs from the cert
+    SAN=$(echo "$SSL_INFO" \
+        | openssl x509 -noout -text 2>/dev/null \
+        | awk '/X509v3 Subject Alternative Name/ {getline; print}' \
+        | sed 's/DNS://g' \
+        | tr ',' '\n' \
+        | awk '{$1=$1};1')
+
+    if [ -n "$SAN" ]; then
+        info "Extracted Subject Alternative Names (SAN) from $HOST:$PORT:"
+        echo "$SAN" | while read -r entry; do
+            echo -e "    ${CYAN}- $entry${RESET}"
+            echo "$entry" >> "$DISCOVERED_HOSTS"
+        done
+        
+        if [ "$port" -eq 636 ]; then
+            # Try to infer the base domain from SAN entries (e.g. scrm.local)
+            DOMAIN_CONTROLLER=$(echo "$SAN" | grep -m1 -Eo '[a-zA-Z0-9.-]+\.[a-z]{2,}$')
+            echo "$TARGET $DOMAIN_CONTROLLER" >> "$HOSTS_FILE"
+            
+            if [ -n "$DOMAIN_CONTROLLER" ]; then
+               note "Detected Domain Controller from SAN: ${GREEN}$DOMAIN_CONTROLLER${RESET}"
+               #echo "$DOMAIN_CONTROLLER" >> "$DISCOVERED_HOSTS"
+
+               # If LDAP domain isn't already set, assign it
+               #if [ -z "$LDAP_DOMAIN" ]; then
+               #    LDAP_DOMAIN="$BASE_DOMAIN"
+               #    note "LDAP domain set from SAN: ${GREEN}$LDAP_DOMAIN${RESET}"
+            fi
+        fi
+    else
+        warn "No Subject Alternative Name (SAN) entries found in certificate."
+    fi
+}
+
+ensure_krb5_conf_from_ldap() {
+    local DOMAIN="$1"      # e.g. scrm.local
+    local DC_IP="$2"       # e.g. 10.129.3.54
+    local DC_Host="$3"     # e.g. dc1.scrm.local
+    local KRB5_FILE="/etc/krb5.conf"
+    local REALM_UPPER
+    REALM_UPPER=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
+
+    if [ -z "$DOMAIN" ] || [ -z "$DC_IP" ] || [ -z "$DC_Host" ]; then
+        warn "Missing DOMAIN, DC_Host, or DC_IP for krb5.conf generation"
+        return 1
+    fi
+
+    info "Validating krb5.conf for realm: ${REALM_UPPER}, ${DC_Host} | ${DC_IP}"
+
+    # Check if krb5.conf already has the realm
+    if grep -qi "default_realm *= *$REALM_UPPER" "$KRB5_FILE" && \
+       grep -q "^\s*$REALM_UPPER\s*=" "$KRB5_FILE"; then
+        success "krb5.conf already configured for realm ${REALM_UPPER}"
+        return 0
+    fi
+
+    backup_file="${KRB5_FILE}.bak.$(date +%s)"
+    sudo cp "$KRB5_FILE" "$backup_file"
+    notify "Backed up existing krb5.conf to: $backup_file"
+
+    # Replace krb5.conf with minimal working config
+    echo
+    critical "Generating krb5.conf for LDAP realm: ${REALM_UPPER}"
+
+    sudo bash -c "cat > $KRB5_FILE" <<EOF
+[libdefaults]
+    default_realm = $REALM_UPPER
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+    forwardable = true
+    rdns = false
+
+[realms]
+    $REALM_UPPER = {
+        kdc = $DC_IP
+        admin_server = $DC_Host
+        default_domain = $DOMAIN
     }
 
-    if [ -n "$sans" ]; then
-        finding "SSL SANs:"
-        echo "$sans" | while read san; do
-            [ -n "$san" ] && {
-                echo -e "${YELLOW}    - $san${RESET}"
-                echo "$TARGET $san" >> "$HOSTS_FILE"
-                echo "$san" >> "$DISCOVERED_HOSTS"
-            }
-        done
-    fi
+[domain_realm]
+    .$DOMAIN = $REALM_UPPER
+    $DOMAIN = $REALM_UPPER
+EOF
+
+    success "krb5.conf generated for realm $REALM_UPPER with DC $DC_IP"
 }
 
 getnpusers_cmd() {
@@ -421,6 +526,7 @@ cme_enum_users() {
     # --- 2. Auth success but enumeration explicitly denied ---
     if echo "$RAW_CME" | grep -qiE 'Error enumerating domain users|NTLM needs domain\\\\username'; then
         notify "SMB authentication successful ($AUTH_LABEL), but user enumeration is not permitted"
+        SMB_AUTH_OK=true
         return 0
     fi
 
@@ -460,7 +566,8 @@ cme_enum_users() {
 
     # --- 5. Enumeration succeeded ---
     high_risk "SMB user enumeration successful ($AUTH_LABEL)"
-    echo -e "   ${YELLOW}Users Discovered:${RESET}"
+    SMB_AUTH_OK=true
+    echo -e "    ${YELLOW}Users Discovered:${RESET}"
 
     while IFS="|" read -r user desc; do
         echo -e "      - ${BYELLOW}$user${RESET}"
@@ -839,7 +946,9 @@ kerberos_auth_check() {
         notify "Kerberos realm not known — skipping auth check"
         return
     fi
-
+    
+    ensure_krb5_conf_from_ldap "$LDAP_DOMAIN" "$TARGET" "$DOMAIN_CONTROLLER"
+    
     echo
     info "Validating Kerberos credentials (safe check)"
     echo "[DEBUG] kinit $AUTH_USER@$KERB_REALM"
@@ -897,19 +1006,10 @@ kerberos_enum_users() {
     )
     
     USERFILE_OK=true
-    
-    # Validate USERS_FILE
-    if [[ -z "${USERS_FILE:-}" ]]; then
-        notify "USERS_FILE variable not set — skipping AS-REP roasting"
-        USERFILE_OK=false
-    elif [[ ! -f "$USERS_FILE" ]]; then
-        notify "USERS_FILE does not exist ($USERS_FILE) — skipping AS-REP roasting"
-        USERFILE_OK=false
-    elif [[ ! -s "$USERS_FILE" ]]; then
-        notify "USERS_FILE exists but is empty — skipping AS-REP roasting"
-        USERFILE_OK=false
-    fi
-
+    # Ensure USERS_FILE is initialized
+    [ -z "$USERS_FILE" ] && USERS_FILE="users_${TARGET}_kerbenum.txt"
+    # Create users file if it doesn't exist
+    [ ! -f "$USERS_FILE" ] && touch "$USERS_FILE"
     FOUND=false
     AUTH_OK=false
     ASREP_OK=false
@@ -919,14 +1019,31 @@ kerberos_enum_users() {
     ########################################
     info "Attempting unauthenticated Kerberos user enumeration"
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET -no-pass${RESET}"
-
+    if [ -z "$DOMAIN_CONTROLLER" ]; then
+        echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET -no-pass${RESET}"
+    else
+        echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET -no-pass -dc-host $DOMAIN_CONTROLLER -k${RESET}"
+    fi
+ 
     for user in "${COMMON_USERS[@]}"; do
-        timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET" -no-pass 2>&1 \
-            | grep -qi 'preauth' && {
-                success "Valid Kerberos user (unauth): ${BYELLOW}$user${RESET}"
-                FOUND=true
-            }
+        if [ -z "$DOMAIN_CONTROLLER" ]; then
+            timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET" -no-pass 2>&1 \
+                | grep -qi 'preauth' && {
+                    success "Valid Kerberos user (unauth): ${BYELLOW}$user${RESET}"
+                    FOUND=true
+                    # Append only if not already present
+                    grep -Fxq "$user" "$USERS_FILE" || echo "$user" >> "$USERS_FILE"
+               }
+        else
+            timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET" -no-pass -dc-host $DOMAIN_CONTROLLER -k 2>&1 \
+                | grep -qi 'preauth' && {
+                    success "Valid Kerberos user (unauth): ${BYELLOW}$user${RESET}"
+                    FOUND=true
+                    # Append only if not already present
+                    grep -Fxq "$user" "$USERS_FILE" || echo "$user" >> "$USERS_FILE"
+                }
+        fi
+        
     done
 
     ########################################
@@ -936,18 +1053,32 @@ kerberos_enum_users() {
         echo
         info "Attempting authenticated Kerberos enumeration"
 
-        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET${RESET}"
-
-        OUT=$(timeout 6 "$KERB_CMD" \
-            "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
-            -dc-ip "$TARGET" 2>&1)
+        #OUT=$(timeout 6 "$KERB_CMD" \
+        #    "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
+        #    -dc-ip "$TARGET" 2>&1)
+        
+        if [ -z "$DOMAIN_CONTROLLER" ]; then
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET -k -debug${RESET}"
+            OUT=$(timeout 6 "$KERB_CMD" \
+                "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
+                -dc-ip "$TARGET" -k 2>&1)
+        else
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-host $DOMAIN_CONTROLLER -dc-ip $TARGET -k -debug${RESET}"
+            OUT=$(timeout 6 "$KERB_CMD" \
+                "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
+                -dc-host "$DOMAIN_CONTROLLER" \
+                -dc-ip "$TARGET" -k 2>&1)
+        fi
+        
 
         # --- AUTH SUCCESS CONDITIONS ---
         if echo "$OUT" | grep -qiE '\$krb5asrep\$|No entries found!'; then
             success "Kerberos authentication successful (authenticated enumeration)"
             AUTH_OK=true
             FOUND=true
+            KERBEROS_AUTH_OK=true
         fi
 
         # --- REAL AUTH FAILURE ---
@@ -960,9 +1091,20 @@ kerberos_enum_users() {
     ########################################
     # 4. Attempt to perform ASREP Roast
     ########################################
+    # Validate USERS_FILE
+    if [[ -z "${USERS_FILE:-}" ]]; then
+        notify "USERS_FILE variable not set — skipping AS-REP roasting"
+        USERFILE_OK=false
+    elif [[ ! -f "$USERS_FILE" ]]; then
+        notify "USERS_FILE does not exist ($USERS_FILE) — skipping AS-REP roasting"
+        USERFILE_OK=false
+    elif [[ ! -s "$USERS_FILE" ]]; then
+        notify "USERS_FILE exists but is empty — skipping AS-REP roasting"
+        USERFILE_OK=false
+    fi
     if $USERFILE_OK; then
         ########################################
-        #   AS-REP roast attempt - Unauthenticate
+        #   AS-REP roast attempt - Unauthenticated
         ########################################
         info "Attempting AS-REP roast using discovered users - Unauthenticated"
         note "User file: $USERS_FILE"
@@ -1377,7 +1519,7 @@ check_rpc_services() {
     # 3. Authenticated MSRPC (rpcclient) if creds provided
     # ------------------------------
     if $CREDS_PROVIDED && command -v rpcclient >/dev/null; then
-        info "Testing authenticated SMB RPC (rpcclient -U $AUTH_USER%)"
+        info "Testing authenticated SMB RPC (rpcclient -U $AUTH_USER%$AUTH_PASS)"
         if echo "exit" | rpcclient -U "$AUTH_USER%$AUTH_PASS" "$target" 2>&1 | grep -vq "NT_STATUS_LOGON_FAILURE"; then
             critical "Authenticated SMB RPC login successful!"
             RPC_AUTH_OK=true
@@ -1388,7 +1530,84 @@ check_rpc_services() {
     fi
 }
 
+#SMB_V1=false
+#SMB_V2=false
+#SMB_V3=false
+#SMB_SIGNING=false
+check_smb_protocols() {
+    local TARGET_IP=$1
 
+    if command -v nmap >/dev/null 2>&1; then
+        info "Checking SMB protocol support via nmap"
+
+        PROTO_OUTPUT=$(nmap --script smb-protocols -p445 "$TARGET_IP" 2>/dev/null)
+
+        if echo "$PROTO_OUTPUT" | grep -q "1.0"; then
+            notify "SMBv1 is ENABLED (insecure)!"
+            SMB_V1=true
+        else
+            success "SMBv1 is NOT supported!"
+        fi
+
+        if echo "$PROTO_OUTPUT" | grep -E -q "2\.0|2\.1"; then
+            success "SMBv2 is supported!"
+            SMB_V2=true
+        fi
+
+        if echo "$PROTO_OUTPUT" | grep -E -q "3\.0|3\.1|3\.0\.2|3\.1\.1"; then
+            success "SMBv3 is supported!"
+            SMB_V3=true
+        fi
+    else
+        warn "nmap not found — skipping SMB protocol detection"
+    fi
+}
+
+
+check_ntlm_support() {
+    local TARGET_IP=$1
+
+    SMB_SIGNING=false
+
+    if command -v crackmapexec >/dev/null 2>&1; then
+        info "Checking SMB signing and NTLM support via CME"
+
+        CME_OUT=$(crackmapexec smb "$TARGET_IP" 2>/dev/null)
+
+        if echo "$CME_OUT" | grep -q "signing:.*True"; then
+            info "SMB Signing is enforced"
+            SMB_SIGNING=true
+        else
+            notify "SMB Signing is NOT enforced!"
+        fi
+
+        if echo "$CME_OUT" | grep -q "SMBv1:.*True"; then
+            notify "SMBv1 is ENABLED (insecure)!"
+            SMB_V1=true
+        fi
+
+        echo
+        info "Testing NTLM support via guest login"
+        OUT=$(crackmapexec smb "$TARGET_IP" -u "guest" -p "" 2>/dev/null)
+
+        if echo "$OUT" | grep -q "STATUS_NOT_SUPPORTED"; then
+            notify "NTLM authentication appears to be DISABLED (STATUS_NOT_SUPPORTED)"
+        elif echo "$OUT" | grep -q "\[-\]"; then
+            notify "NTLM authentication attempted, but failed — NTLM likely ENABLED!"
+            NTLM_ENABLED=true
+        elif echo "$OUT" | grep -q "\[\+\]"; then
+            critical "NTLM authentication SUCCESSFUL — NTLM is ENABLED!"
+            NTLM_ENABLED=true
+        else
+            warn "NTLM test inconclusive — unknown response"
+        fi
+    else
+        warn "crackmapexec not found — skipping NTLM check"
+    fi
+}
+# -------------------------------------------------------
+# ------------------------ START ------------------------
+# -------------------------------------------------------
 
 # --------- Ports ----------
 PORTS=(
@@ -1491,6 +1710,8 @@ if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
     echo
 fi
 
+resolve_hostname_to_ip "$TARGET"
+
 # --------- Function to Scan a Single Port ----------
 # ---------- PORT SCAN LOOP ----------
 echo -e "\n${BLUE}========================================${RESET}"
@@ -1568,8 +1789,6 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
         if [[ "$ldap_dn" =~ ^DC= ]]; then
 		LDAP_DOMAIN=$(echo "$ldap_dn" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
 		note "LDAP domain detected: ${GREEN}$LDAP_DOMAIN${RESET}"
-		
-		note "LDAP domain detected: ${GREEN}$LDAP_DOMAIN${RESET}"
 
 		echo "$TARGET $LDAP_DOMAIN" >> "$HOSTS_FILE"
 		echo "$LDAP_DOMAIN" >> "$DISCOVERED_HOSTS"
@@ -1579,11 +1798,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
 		info "LDAP service present/open but DOMAIN not disclosed"
         fi
     fi
-    
-    # Get Cert Info
-    [ "$PORT" = "636" ] && extract_ssl_info $TARGET
-    [ "$PORT" = "443" ] && extract_ssl_info $TARGET
-    [ "$PORT" = "8443" ] && extract_ssl_info $TARGET
+
 
     if [ "$PORT" = "6379" ] && command -v redis-cli >/dev/null; then
         if redis-cli -h "$TARGET" ping 2>/dev/null | grep -qi PONG; then
@@ -1611,6 +1826,33 @@ if [ -s "$OPEN_PORTS_FILE" ]; then
     mapfile -t OPEN_PORTS < <(sort -n "$OPEN_PORTS_FILE")
 fi
 
+# --------- Define LDAP_DOMAIN ----------
+echo
+if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "389"; then
+        LDAP_URI="ldap://$TARGET"
+    elif printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "636"; then
+	LDAP_URI="ldaps://$TARGET"
+    fi
+    ldap_dn=$(
+         ldapsearch -x -H "$LDAP_URI" -s base -b "" defaultNamingContext 2>/dev/null \
+         | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
+     )
+     
+     if [ -n "$LDAP_DOMAIN" ]; then
+        info "LDAP_DOMAIN is already set: ${BLUE}'${LDAP_DOMAIN}'${RESET}"
+     else
+        info "LDAP_DOMAIN not set yet."
+     fi
+     
+     if [[ "$ldap_dn" =~ ^DC= ]]; then
+        LDAP_DOMAIN=$(echo "$ldap_dn" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
+        info "LDAP service present/open. DOMAIN is disclosed: ${BLUE}$LDAP_DOMAIN${RESET}"
+     else
+     	info "LDAP service present/open but DOMAIN not disclosed"
+     fi
+fi
+
 # --------- Debug / Visibility ----------
 if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
     echo
@@ -1623,11 +1865,20 @@ if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
 else
     warn "No open ports detected"
 fi
+
 echo -e "\n${BLUE}========================================${RESET}"
 
 echo -e "\n${BLUE}========================================${RESET}"
 echo -e "${BYELLOW}  Post-Scan Service Exposure Checks ${RESET}"
 echo -e "${BLUE}========================================${RESET}"
+
+if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
+    for port in "${OPEN_PORTS[@]}"; do
+        if [ "$port" -eq 443 ] || [ "$port" -eq 636 ] || [ "$port" -eq 8443 ]; then
+            extract_ssl_info "$TARGET" "$port"
+        fi
+    done
+fi
 
 # --------- FTP Checks (post-scan) ----------
 if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
@@ -1663,6 +1914,9 @@ if [ -s "$SMB_MARKER" ]; then
     echo
     info "SMB ports detected (139/445) — enumerating shares & permissions..."
 
+    check_smb_protocols "$TARGET"
+    check_ntlm_support "$TARGET"
+
     SMB_ENUM_SUCCESS=false
 
     color_perm() {
@@ -1684,9 +1938,69 @@ if [ -s "$SMB_MARKER" ]; then
     
     smb_auth_check() {
         local AUTH="$1"
+        local SMB_VER_ARG=""
 
-	smbclient -L "//$TARGET" -U "$AUTH" -m SMB3 -c 'exit' >/dev/null 2>&1
-	return $?
+        # Prefer highest supported SMB version
+        if $SMB_V3; then
+            SMB_VER_ARG="-m SMB3"
+        elif $SMB_V2; then
+            SMB_VER_ARG="-m SMB2"
+        elif $SMB_V1; then
+            SMB_VER_ARG="-m NT1"  # NT1 is the alias for SMBv1 in smbclient
+        else
+            warn "No supported SMB version detected — falling back to default"
+            SMB_VER_ARG="-m SMB3"
+        fi
+        
+        echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+	echo -e "           ${GREEN}smbclient -L '//$TARGET' -U '$AUTH' $SMB_VER_ARG -c 'exit'${RESET}"
+        
+        # Capture smbclient output
+        local OUT
+        OUT=$(smbclient -L "//$TARGET" -U "$AUTH" $SMB_VER_ARG -c 'exit' 2>&1)
+
+        # NTLM disabled = return failure (do NOT treat as special case externally)
+        if echo "$OUT" | grep -q "NT_STATUS_NOT_SUPPORTED"; then
+            # Optionally log for debugging
+            echo -e "        ${YELLOW}(NTLM disabled: NT_STATUS_NOT_SUPPORTED)${RESET}" >&2
+            NTLM_ENABLED=false
+            # Check for valid Kerberos 
+            if [ -n "$ORIGINAL_HOSTNAME" ]; then
+                echo -e "        ${BLUE}(Attempting Kerberos fallback via smbclient -k)${RESET}"
+                echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+                echo -e "           ${GREEN}impacket-smbclient -k ${ORIGINAL_HOSTNAME}/${AUTH_USER}:${AUTH_PASS}@${ORIGINAL_HOSTNAME} -target-ip "$TARGET" -c 'ls' ${RESET}"
+                echo -e ""
+                echo -e "   *** TODO.... Kerberos Test is not implemented      ***"
+                echo -e "   ***   Notes: Run NAMP -sC -sV $TARGET              ***"
+                echo -e "   ***          to identify Hostname (DNS:[hostname]) ***"
+                echo -e ""
+                #if impacket-smbclient \
+                #    -k \
+                #    "${LDAP_DOMAIN}/${AUTH_USER}@${ORIGINAL_HOSTNAME}" \
+                #    -target-ip "$TARGET" \
+                #    -no-pass \
+                #    -port 445 \
+                #    -c 'ls' \
+                #    >/dev/null 2>&1; then
+                #    return 0
+                #fi
+            fi
+            
+            echo -e "        ${RED}Kerberos fallback failed${RESET}"
+            return 1
+        fi
+
+        # Success = "Sharename" appears
+        if echo "$OUT" | grep -q "Sharename"; then
+            return 0
+        fi
+
+        # Any other failure
+        return 1
+        
+        # Try listing shares with the chosen protocol version
+        #smbclient -L "//$TARGET" -U "$AUTH" $SMB_VER_ARG -c 'exit' >/dev/null 2>&1
+        #return $?
     }
 
     smb_list_files() {
@@ -1941,24 +2255,6 @@ fi
 if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     echo
     info "Querying LDAP RootDSE..."
-
-
-    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "389"; then
-        LDAP_URI="ldap://$TARGET"
-    elif printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "636"; then
-	LDAP_URI="ldaps://$TARGET"
-    fi
-    ldap_dn=$(
-         ldapsearch -x -H "$LDAP_URI" -s base -b "" defaultNamingContext 2>/dev/null \
-         | sed -n 's/^defaultNamingContext:[[:space:]]*//p'
-     )
-
-     if [[ "$ldap_dn" =~ ^DC= ]]; then
-        LDAP_DOMAIN=$(echo "$ldap_dn" | sed 's/DC=//g; s/,/./g' | tr '[:upper:]' '[:lower:]')
-        info "LDAP service present/open. DOMAIN is disclosed: ${BLUE}$LDAP_DOMAIN${RESET}"
-     else
-     	info "LDAP service present/open but DOMAIN not disclosed"
-     fi
     
     #echo "LDAP_ENUM ANON"
     echo
@@ -2023,7 +2319,7 @@ fi
 # --------- Kerberos Post-Scan Handling ----------
 if [ -s "$KERB_MARKER" ]; then
     KERB_DETECTED=true
-
+    
     if resolve_kerberos_realm; then
         if $ENABLE_KERB_ENUM; then
             kerberos_enum_users
@@ -2075,16 +2371,16 @@ if $CREDS_PROVIDED; then
 
     # MSSQL
     if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "1433" \
-       && command -v crackmapexec >/dev/null; then
+        && command -v crackmapexec >/dev/null; then
 
-       #echo "[DEBUG] Creds were provided for CME targeting MSSQL"
+        #echo "[DEBUG] Creds were provided for CME targeting MSSQL"
        
-       lightbulb "Trying MSSQL:"
-       lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
-             echo -e "        ${GREEN}crackmapexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
-             echo -e "        ${GREEN}netexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+        lightbulb "Trying MSSQL:"
+        lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}crackmapexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+            echo -e "        ${GREEN}netexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
        
-       if crackmapexec mssql "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
+        if crackmapexec mssql "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
             | grep -qi success; then
             critical "MSSQL credential reuse confirmed"
         else
@@ -2093,9 +2389,9 @@ if $CREDS_PROVIDED; then
     fi
 fi
 
-########################################
+###########################################
 # AD CS Vulnerable Certificate Detection
-########################################
+###########################################
 if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CREDS_PROVIDED" == true ]]; then
     echo
     target_ca=""
@@ -2565,6 +2861,7 @@ if [[ $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 && $DC_AUTH_OK -eq 1 ]]; then
    fi
 fi
 
+[ "$NTLM_ENABLED" = false ] && NTLM_DISABLED=true
 generate_synopsis() {
     echo -e "\n${BLUE}========================================${RESET}"
     echo -e "${BYELLOW}          RECON SYNOPSIS               ${RESET}"
@@ -2591,9 +2888,12 @@ generate_synopsis() {
     }
 
     # 1. Active Directory / Kerberos
-    if [ "$LDAP_ANON_BIND" = true ] || [ "$LDAP_GUEST_BIND" = true ] || [ "$LDAP_AUTH_BIND" = true ] || [ "$ASREP_OK" = true ] || [ "$KERBEROS_AUTH_OK" = true ] || [ "$CAN_JOIN_COMPUTERS_TO_DOMAIN" = true ]; then
+    
+    if [ "$NTLM_ENABLED" = true ] || [ "$LDAP_ANON_BIND" = true ] || [ "$LDAP_GUEST_BIND" = true ] || [ "$LDAP_AUTH_BIND" = true ] || [ "$ASREP_OK" = true ] || [ "$KERBEROS_AUTH_OK" = true ] || [ "$CAN_JOIN_COMPUTERS_TO_DOMAIN" = true ]; then
         echo -e "\n ${CYAN}ACTIVE DIRECTORY (AD) SERVICES${RESET}"
         echo -e " --------------------------------------"
+        print_item "$NTLM_ENABLED" "NTLM is Enabled"
+        print_item "$NTLM_DISABLED" "NTLM is Disabled. Use KERBEROS!"
         print_item "$KERBEROS_AUTH_OK" "Valid Kerberos Credentials ($AUTH_USER)"
         print_item "$LDAP_ANON_BIND" "Anonymous LDAP bind is possible (Information Disclosure)"
         print_item "$LDAP_GUEST_BIND" "LDAP Guest bind is possible (Information Disclosure)"
@@ -2630,10 +2930,14 @@ generate_synopsis() {
     fi
 
     # 3. File Services
-    if [ "$FTP_ANON_OK" = true ] || [ "$SMB_GUEST_OK" = true ] || [ "$SMB_NULL_OK" = true ] || [ "$SMB_AUTH_OK" = true ]; then
+    if [ "$SMB_V1" = true ] || [ "$SMB_V2" = true ] || [ "$SMB_V3" = true ] || [ "$FTP_ANON_OK" = true ] || [ "$SMB_GUEST_OK" = true ] || [ "$SMB_NULL_OK" = true ] || [ "$SMB_AUTH_OK" = true ]; then
         echo -e "\n ${CYAN}FILE SERVICES${RESET}"
         echo -e " --------------------------------------"
         print_item "$FTP_ANON_OK" "Anonymous FTP access is enabled"
+        print_item "$SMB_V1" "SMB V1 is Supported"
+        print_item "$SMB_V2" "SMB V2 is Supported"
+        print_item "$SMB_V3" "SMB V3 is Supported"
+        print_item "$SMB_SIGNING" "SMB Signing is Enforced"
         print_item "$SMB_GUEST_OK" "SMB Guest access is enabled"
         print_item "$SMB_NULL_OK" "SMB NULL Session is possible"
         print_item "$SMB_AUTH_OK" "Authenticated SMB access confirmed"

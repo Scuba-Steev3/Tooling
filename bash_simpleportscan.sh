@@ -41,6 +41,9 @@ set -euo pipefail
 START_TIME=$(date +%s)
 
 DEFAULT_TARGET="127.0.0.1"
+AUTH_USER_DN=""
+declare -a AUTH_USER_GROUP_DNS=()
+declare -a AUTH_USER_GROUP_NAMES=()
 TARGET=""
 TARGET_IPV4=""
 TARGET_FQDN=""
@@ -55,6 +58,7 @@ ENABLE_BH_EXPORT=false
 ENABLE_KERBROAST=false
 KERBEROS_FOUND=false
 NTLM_ENABLED=false
+NTLM_TIME_SYNC_NOTE_SHOWN=false
 LDAP_FOUND=false
 LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
@@ -109,6 +113,16 @@ HAS_WRITABLE_COMPUTER_ACL=false
 KERBEROAST_HASH_FOUND=false     # Set when Kerberoast output is non-empty
 SPN_NAME=""                     # Parse from Kerberoast result
 BH_ZIP_FILE=""
+ENABLE_DNS_ENUM=false
+DNS_BRUTE=false
+DNS_AXFR=true
+DNS_WORDLIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+DNS_DOMAIN=""
+DNS_ENUM_DONE=false
+DNS_FOUND=false
+DNS_ZONE_XFER_OK=false
+DNS_LOOT_FILE=""
+DNS_AXFR_FILE=""
 
 # --------- Certificate Services / AD CS ----------
 HAS_CERTIPY=0
@@ -182,6 +196,18 @@ for arg in "$@"; do
         --check-ca) ENABLE_ADCS=true ;;
         --check-mssql) ENABLE_MSSQL_ENUM=true ;;
         --mssql-brute) ENABLE_MSSQL_BRUTE=true ;;
+        --dns-enum) ENABLE_DNS_ENUM=true ;;
+        --dns-brute) ENABLE_DNS_ENUM=true DNS_BRUTE=true ;;
+        --dns-no-axfr) DNS_AXFR=false;;
+        --dns-domain=*) 
+            DNS_DOMAIN="${arg#*=}" 
+            ENABLE_DNS_ENUM=true 
+        ;;
+        --dns-wordlist=*) 
+            DNS_WORDLIST="${arg#*=}" 
+            ENABLE_DNS_ENUM=true 
+            DNS_BRUTE=true 
+        ;;
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
@@ -261,6 +287,121 @@ critical()  { echo -e "${RED}${ICON_CRIT} ${RESET} ${RED}$*${RESET}"; }
 danger()    { echo -e "${RED}☠ ${RESET} $*"; }
 alert()     { echo -e "${RED}${ICON_ALERT} ${RESET} $*"; }
 lightbulb() { echo -e "${YELLOW}${ICON_TIP} ${RESET} $*"; }
+
+is_ipv4() {
+    [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+get_preferred_dc_host() {
+    # Prefer a Kerberos/SPN-safe hostname. Certipy Kerberos checks should not target a raw IP.
+    # Priority: LDAPS SAN/RootDSE DC host -> resolved FQDN -> original hostname -> domain -> IP fallback.
+    local fallback_ip="${1:-$TARGET_IPV4}"
+    local candidate
+
+    for candidate in "${DOMAIN_CONTROLLER:-}" "${TARGET_FQDN:-}" "${ORIGINAL_HOSTNAME:-}"; do
+        if [[ -n "$candidate" ]] && ! is_ipv4 "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    if [[ -n "${LDAP_DOMAIN:-}" ]] && ! is_ipv4 "$LDAP_DOMAIN"; then
+        echo "$LDAP_DOMAIN"
+        return 0
+    fi
+
+    if [[ -n "${AUTH_DOMAIN:-}" ]] && ! is_ipv4 "$AUTH_DOMAIN"; then
+        echo "$AUTH_DOMAIN"
+        return 0
+    fi
+
+    echo "$fallback_ip"
+}
+
+print_ntlm_kerberos_time_sync_note() {
+    # Kerberos failures after NTLM is disabled are commonly caused by clock skew.
+    # Show this once to avoid noisy output from repeated SMB/LDAP fallbacks.
+    local dc_hint="${1:-}"
+    local dc_host
+
+    if [[ "${NTLM_TIME_SYNC_NOTE_SHOWN:-false}" == true ]]; then
+        return 0
+    fi
+
+    dc_host="$(get_preferred_dc_host "$dc_hint")"
+    [[ -z "$dc_host" ]] && dc_host="$TARGET_IPV4"
+
+    echo
+    lightbulb "NTLM is disabled. Kerberos is time-sensitive; sync Kali's clock with the DC if Kerberos auth fails."
+    echo -e "        ${GREEN}sudo ntpdate -u '$dc_host'${RESET}"
+    echo -e "        ${GREEN}while true; do sudo ntpdate -u '$dc_host'; sleep 2; done${RESET}"
+    echo
+
+    NTLM_TIME_SYNC_NOTE_SHOWN=true
+}
+
+kerberos_ccache_reminder() {
+    local domain_lc domain_uc dc_host ccache_file
+
+    domain_lc="${LDAP_DOMAIN:-$AUTH_DOMAIN}"
+    domain_lc="${domain_lc,,}"
+    domain_uc="${domain_lc^^}"
+
+    dc_host="${DOMAIN_CONTROLLER:-$TARGET_FQDN}"
+    if [[ -z "$dc_host" || "$dc_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        dc_host="$domain_lc"
+    fi
+
+    ccache_file="${AUTH_USER}.ccache"
+
+    echo
+    alert "Kerberos ticket / ccache reminder"
+    echo "  --------------------------------------"
+    note "NTLM may be disabled or unreliable. Generate a local Kerberos ticket before Certipy, BloodHound, Evil-WinRM, or Impacket Kerberos commands."
+    echo
+    echo -e "     ${YELLOW}${ICON_TIP} Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}sudo ntpdate -u '$dc_host'${RESET}"
+    echo -e "        ${GREEN}rm -f ./*.ccache${RESET}"
+    echo -e "        ${GREEN}impacket-getTGT '${domain_lc}/${AUTH_USER}:${AUTH_PASS}' -dc-ip '${TARGET_IPV4}'${RESET}"
+    echo -e "        ${GREEN}export KRB5CCNAME=\"\$(pwd)/${ccache_file}\"${RESET}"
+    echo -e "        ${GREEN}klist${RESET}"
+    echo
+    note "Aggressive HTB/lab time-sync loop:"
+    echo -e "        ${GREEN}while true; do sudo ntpdate -u '$dc_host'; sleep 2; done${RESET}"
+    echo
+}
+
+create_local_kerberos_ccache() {
+    local domain_lc domain_uc ccache_file principal
+
+    if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" || -z "${LDAP_DOMAIN:-}" || -z "${TARGET_IPV4:-}" ]]; then
+        warn "Missing AUTH_USER, AUTH_PASS, LDAP_DOMAIN, or TARGET_IPV4 — cannot create Kerberos ccache"
+        return 1
+    fi
+
+    domain_lc="${LDAP_DOMAIN,,}"
+    domain_uc="${LDAP_DOMAIN^^}"
+    ccache_file="$(pwd)/${AUTH_USER}.ccache"
+    principal="${AUTH_USER}@${domain_uc}"
+
+    info "Creating local Kerberos ccache for ${principal}"
+    echo -e "     ${YELLOW}${ICON_TIP} Copy/Paste equivalent:${RESET}"
+    echo -e "        ${GREEN}printf '%s\n' '$AUTH_PASS' | kinit -c '$ccache_file' '$principal'${RESET}"
+
+    rm -f "$ccache_file"
+
+    if printf '%s\n' "$AUTH_PASS" | kinit -c "$ccache_file" "$principal"; then
+        export KRB5CCNAME="$ccache_file"
+        success "Kerberos ccache created: $KRB5CCNAME"
+        klist -c "$KRB5CCNAME"
+        return 0
+    fi
+
+    warn "kinit failed. Try Impacket manually:"
+    echo -e "        ${GREEN}impacket-getTGT '${domain_lc}/${AUTH_USER}:${AUTH_PASS}' -dc-ip '${TARGET_IPV4}'${RESET}"
+    echo -e "        ${GREEN}export KRB5CCNAME=\"\$(pwd)/${AUTH_USER}.ccache\"${RESET}"
+    return 1
+}
 
 ORIGINAL_HOSTNAME=""
 resolve_hostname_to_ip() {
@@ -752,6 +893,224 @@ nxc_enum_users() {
     return 0
 }
 
+export_authenticated_user_groups() {
+    local DATE_TAG USER_GROUPS_CSV USER_GROUPS_TXT RAW_GROUPS_FULL
+    local BIND_DN
+
+    if [[ "$LDAP_BIND_TYPE" != "auth" ]]; then
+        info "Skipping authenticated user group export — no authenticated LDAP bind"
+        return 0
+    fi
+
+    if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" || -z "${LDAP_DOMAIN:-}" || -z "${LDAP_BASE_DN:-}" ]]; then
+        warn "Missing AUTH_USER / AUTH_PASS / LDAP_DOMAIN / LDAP_BASE_DN — skipping group export"
+        return 1
+    fi
+
+    if ! command -v ldapsearch >/dev/null 2>&1; then
+        warn "ldapsearch not found — skipping authenticated user group export"
+        return 1
+    fi
+
+    BIND_DN="${AUTH_USER}@${LDAP_DOMAIN}"
+
+    info "Exporting group membership for authenticated user: ${AUTH_USER}"
+    note "LDAP bind DN: ${BIND_DN}"
+    note "LDAP base DN: ${LDAP_BASE_DN}"
+
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    USER_GROUPS_CSV="user_groups_${AUTH_USER}_${TARGET_IPV4}_${DATE_TAG}.csv"
+    USER_GROUPS_TXT="user_groups_${AUTH_USER}_${TARGET_IPV4}_${DATE_TAG}.txt"
+
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}ldapsearch -LLL -x -H ldap://$TARGET_IPV4 -D '$BIND_DN' -w '$AUTH_PASS' -b '$LDAP_BASE_DN' '(sAMAccountName=${AUTH_USER})' distinguishedName memberOf${RESET}"
+
+    AUTH_USER_DN=$(
+        ldapsearch -LLL -x \
+            -H "ldap://$TARGET_IPV4" \
+            -D "$BIND_DN" \
+            -w "$AUTH_PASS" \
+            -b "$LDAP_BASE_DN" \
+            "(sAMAccountName=${AUTH_USER})" distinguishedName 2>/dev/null \
+        | awk -F': ' '/^distinguishedName: / {print $2; exit}'
+    )
+
+    mapfile -t AUTH_USER_GROUP_DNS < <(
+        ldapsearch -LLL -x \
+            -H "ldap://$TARGET_IPV4" \
+            -D "$BIND_DN" \
+            -w "$AUTH_PASS" \
+            -b "$LDAP_BASE_DN" \
+            "(sAMAccountName=${AUTH_USER})" memberOf 2>/dev/null \
+        | awk -F': ' '/^memberOf: / {print $2}' \
+        | sort -u
+    )
+
+    AUTH_USER_GROUP_NAMES=()
+    for group_dn in "${AUTH_USER_GROUP_DNS[@]}"; do
+        group_name=$(echo "$group_dn" | sed -n 's/^CN=\([^,]*\).*/\1/p')
+        [[ -n "$group_name" ]] && AUTH_USER_GROUP_NAMES+=("$group_name")
+    done
+
+    if [[ -z "$AUTH_USER_DN" ]]; then
+        warn "Could not resolve DN for ${AUTH_USER} — skipping group export"
+        return 1
+    fi
+
+    if [[ ${#AUTH_USER_GROUP_DNS[@]} -eq 0 ]]; then
+        notify "No group memberships found for ${AUTH_USER}"
+        return 0
+    fi
+
+    printf "%s\n" "${AUTH_USER_GROUP_NAMES[@]}" > "$USER_GROUPS_TXT"
+
+    {
+        echo "Username,UserDN,GroupName,GroupDN"
+        for i in "${!AUTH_USER_GROUP_DNS[@]}"; do
+            printf '"%s","%s","%s","%s"\n' \
+                "$AUTH_USER" \
+                "$AUTH_USER_DN" \
+                "${AUTH_USER_GROUP_NAMES[$i]}" \
+                "${AUTH_USER_GROUP_DNS[$i]}"
+        done
+    } > "$USER_GROUPS_CSV"
+
+    success "Authenticated user DN: ${BLUE}$AUTH_USER_DN${RESET}"
+    success "Authenticated user groups saved to TXT: ${BLUE}$USER_GROUPS_TXT${RESET}"
+    success "Authenticated user groups saved to CSV: ${BLUE}$USER_GROUPS_CSV${RESET}"
+
+    print_section "Groups for ${AUTH_USER} (first 25 shown):" "${AUTH_USER_GROUP_NAMES[@]:0:25}"
+    echo
+}
+
+run_impacket_dacl_audit() {
+    local DACL_TOOL=""
+    local DATE_TAG OUT_DIR USER_DN BIND_DN
+    local -a USER_GROUP_DNS=()
+    local -a TARGETS=()
+    local -a PRINCIPALS=()
+
+    if command -v impacket-dacledit >/dev/null 2>&1; then
+        DACL_TOOL="impacket-dacledit"
+    elif command -v dacledit.py >/dev/null 2>&1; then
+        DACL_TOOL="dacledit.py"
+    else
+        warn "impacket-dacledit / dacledit.py not found — skipping DACL audit"
+        return 1
+    fi
+
+    if [[ "$LDAP_BIND_TYPE" != "auth" ]]; then
+        info "Skipping DACL audit — authenticated LDAP bind required"
+        return 0
+    fi
+
+    if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" || -z "${LDAP_DOMAIN:-}" || -z "${LDAP_BASE_DN:-}" ]]; then
+        warn "Missing AUTH_USER / AUTH_PASS / LDAP_DOMAIN / LDAP_BASE_DN — skipping DACL audit"
+        return 1
+    fi
+
+    if [[ "$DC_AUTH_OK" -ne 1 && -z "${DOMAIN_CONTROLLER:-}" ]]; then
+        info "Skipping DACL audit — target does not appear to be a DC"
+        return 0
+    fi
+
+    if ! command -v ldapsearch >/dev/null 2>&1; then
+        warn "ldapsearch not found — skipping DACL audit"
+        return 1
+    fi
+
+    BIND_DN="${AUTH_USER}@${LDAP_DOMAIN}"
+
+    info "Resolving authenticated user DN and group DNs for DACL audit"
+
+    if [[ -z "${AUTH_USER_DN:-}" ]]; then
+        warn "AUTH_USER_DN is empty — run export_authenticated_user_groups first"
+        return 1
+    fi
+
+    if [[ ${#AUTH_USER_GROUP_DNS[@]} -eq 0 ]]; then
+        notify "No cached group DNs available for ${AUTH_USER}"
+    fi
+
+    mapfile -t USER_GROUP_DNS < <(
+        ldapsearch -LLL -x \
+            -H "ldap://$TARGET_IPV4" \
+            -D "$BIND_DN" \
+            -w "$AUTH_PASS" \
+            -b "$LDAP_BASE_DN" \
+            "(sAMAccountName=${AUTH_USER})" memberOf 2>/dev/null \
+        | awk -F': ' '/^memberOf: / {print $2}' \
+        | sort -u
+    )
+
+    DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+    OUT_DIR="dacledit_${TARGET_IPV4}_${DATE_TAG}"
+    mkdir -p "$OUT_DIR"
+
+    PRINCIPALS+=("$AUTH_USER_DN")
+    if [[ ${#AUTH_USER_GROUP_DNS[@]} -gt 0 ]]; then
+        PRINCIPALS+=("${AUTH_USER_GROUP_DNS[@]}")
+    fi
+
+    TARGETS+=(
+        "$LDAP_BASE_DN"
+        "CN=Users,$LDAP_BASE_DN"
+        "OU=Domain Controllers,$LDAP_BASE_DN"
+        "CN=Domain Admins,CN=Users,$LDAP_BASE_DN"
+        "CN=Administrators,CN=Builtin,$LDAP_BASE_DN"
+        "CN=Account Operators,CN=Builtin,$LDAP_BASE_DN"
+        "CN=Server Operators,CN=Builtin,$LDAP_BASE_DN"
+        "CN=Backup Operators,CN=Builtin,$LDAP_BASE_DN"
+        "CN=Print Operators,CN=Builtin,$LDAP_BASE_DN"
+        "$AUTH_USER_DN"
+    )
+
+    success "Starting read-only DACL audit with $DACL_TOOL"
+    note "Output directory: $OUT_DIR"
+
+    local principal_dn target_dn principal_name target_name outfile cmd_out
+    for principal_dn in "${PRINCIPALS[@]}"; do
+        principal_name=$(echo "$principal_dn" | sed -n 's/^CN=\([^,]*\).*/\1/p' | tr ' /' '__')
+        [[ -z "$principal_name" ]] && principal_name="principal"
+
+        for target_dn in "${TARGETS[@]}"; do
+            target_name=$(echo "$target_dn" | sed -n 's/^CN=\([^,]*\).*/\1/p; s/^OU=\([^,]*\).*/\1/p; t; s/^DC=\([^,]*\).*/domain/p' | tr ' /' '__')
+            [[ -z "$target_name" ]] && target_name="target"
+
+            outfile="$OUT_DIR/${principal_name}__${target_name}.txt"
+
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}$DACL_TOOL -action read -principal-dn '$principal_dn' -target-dn '$target_dn' -dc-ip '$TARGET_IPV4' '${LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}'${RESET}"
+
+            cmd_out=$(
+                timeout 20 "$DACL_TOOL" \
+                    -action read \
+                    -principal-dn "$principal_dn" \
+                    -target-dn "$target_dn" \
+                    -dc-ip "$TARGET_IPV4" \
+                    "${LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}" 2>&1
+            )
+
+            printf "%s\n" "$cmd_out" > "$outfile"
+
+            if echo "$cmd_out" | grep -Eiq 'GenericAll|GenericWrite|WriteDACL|WriteOwner|AllExtendedRights|WriteMembers|ResetPassword|DCSync|FullControl|WriteProperty'; then
+                high_risk "Interesting ACEs found: principal='${principal_dn}' target='${target_dn}'"
+                echo "$cmd_out" | grep -Ei 'GenericAll|GenericWrite|WriteDACL|WriteOwner|AllExtendedRights|WriteMembers|ResetPassword|DCSync|FullControl|WriteProperty' \
+                    | sed 's/^/      /'
+            else
+                info "No obvious high-value rights for principal='${principal_name}' on target='${target_name}'"
+            fi
+        done
+    done
+
+    success "DACL audit complete. Full output saved under: ${BLUE}$OUT_DIR${RESET}"
+
+    echo
+    info "Quick review command:"
+    echo -e "   ${GREEN}grep -RniE 'GenericAll|GenericWrite|WriteDACL|WriteOwner|AllExtendedRights|WriteMembers|ResetPassword|DCSync|FullControl|WriteProperty' '$OUT_DIR'${RESET}"
+    echo
+}
+
 ldap_enum() {
     local USE_AUTH="$1"
     local PASSED_DOMAIN="${2:-}"
@@ -895,6 +1254,14 @@ ldap_enum() {
         set -e
         return
     fi
+	
+    ########################################
+    # 3b. Export groups for authenticated user
+    ########################################
+    if [[ "$LDAP_BIND_TYPE" == "auth" ]]; then
+        export_authenticated_user_groups || true
+    fi
+
     if [[ $NTLM_ENABLED == true ]]; then
         success "Using NTLM LDAP bind type: ${BLUE}$LDAP_BIND_TYPE${RESET}"
     else
@@ -1258,6 +1625,14 @@ ldap_enum() {
         warn "No kerberoastable accounts found (output file empty or not created)"
         rm -f "$KERBEROAST_OUT" 2>/dev/null
     fi
+    
+    ########################################
+    # 8b. Read-only DACL audit with Impacket
+    ########################################
+    if [[ "$LDAP_BIND_TYPE" == "auth" ]]; then
+        run_impacket_dacl_audit || true
+    fi
+    
     echo
     ########################################
     # 9. Writable Computer Objects (RBCD Check — Auth Only)
@@ -1374,6 +1749,53 @@ kerberos_auth_check() {
     else
         warn "Kerberos authentication failed (non-fatal)"
     fi
+}
+
+certipy_prepare_kerberos() {
+    local domain="$1"
+    local dc_host="$2"
+    local realm
+    local date_tag
+
+    if [[ -z "$domain" ]]; then
+        warn "Cannot prepare Certipy Kerberos auth — domain is empty"
+        return 1
+    fi
+
+    realm="${KERB_REALM:-${domain^^}}"
+
+    if ! command -v kinit >/dev/null 2>&1; then
+        warn "kinit not found — cannot create Kerberos ccache for Certipy"
+        return 1
+    fi
+
+    if [[ -n "${KRB5CCNAME:-}" ]] && klist -s >/dev/null 2>&1; then
+        success "Using existing Kerberos ccache for Certipy: ${KRB5CCNAME}"
+        return 0
+    fi
+
+    if [[ -n "$dc_host" && -n "$TARGET_IPV4" ]]; then
+        ensure_krb5_conf_from_ldap "$domain" "$TARGET_IPV4" "$dc_host" || true
+    fi
+
+    date_tag=$(date +"%Y%m%d_%H%M%S")
+    CERTIPY_KRB5_CCACHE="${PWD}/certipy_${AUTH_USER}_${TARGET_IPV4}_${date_tag}.ccache"
+    export KRB5CCNAME="$CERTIPY_KRB5_CCACHE"
+
+    info "Creating Kerberos ccache for Certipy"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}export KRB5CCNAME='$CERTIPY_KRB5_CCACHE'${RESET}"
+    echo -e "        ${GREEN}printf '%s\\n' '<password>' | kinit '${AUTH_USER}@${realm}'${RESET}"
+
+    if printf '%s\n' "$AUTH_PASS" | kinit "${AUTH_USER}@${realm}" >/dev/null 2>&1; then
+        success "Kerberos ccache ready for Certipy: ${KRB5CCNAME}"
+        return 0
+    fi
+
+    warn "Failed to create Kerberos ccache for ${AUTH_USER}@${realm}"
+    print_ntlm_kerberos_time_sync_note "$dc_host"
+    lightbulb "Manual check: kinit '${AUTH_USER}@${realm}' && klist"
+    return 1
 }
 
 resolve_kerberos_realm() {
@@ -2020,6 +2442,8 @@ check_ntlm_support() {
 
     if echo "$OUT" | grep -q "STATUS_NOT_SUPPORTED"; then
         notify "NTLM authentication appears to be DISABLED (STATUS_NOT_SUPPORTED)"
+		NTLM_ENABLED=false
+        print_ntlm_kerberos_time_sync_note "$TARGET_IP"
     elif echo "$OUT" | grep -q "\[-\]"; then
         notify "NTLM authentication attempted, but failed — NTLM likely ENABLED"
         NTLM_ENABLED=true
@@ -2069,6 +2493,208 @@ get_domain_sid() {
         warn "Failed to extract Domain SID."
         echo "$sid_output" > "lookupsid_debug_${target_domain_controller}.log"
     fi
+}
+
+dns_enum() {
+    local dns_server="${1:-$TARGET_IPV4}"
+    local domain="${2:-$DNS_DOMAIN}"
+    local outdir="dns_${dns_server}"
+    local loot_file="${outdir}/dns_loot_${dns_server}.txt"
+
+    DNS_ENUM_DONE=true
+    DNS_LOOT_FILE="$loot_file"
+
+    mkdir -p "$outdir"
+
+    info "Starting DNS enumeration against ${CYAN}${dns_server}${RESET}"
+    echo "[*] DNS enumeration for $dns_server" > "$loot_file"
+
+    if ! command -v dig >/dev/null 2>&1; then
+        warn "dig not found — install dnsutils: sudo apt install dnsutils"
+        return 1
+    fi
+
+    success "DNS server detected or DNS enum requested"
+    DNS_FOUND=true
+
+    echo
+    info "Basic DNS server checks"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server version.bind CHAOS TXT${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server -x $dns_server${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server ANY .${RESET}"
+
+    {
+        echo
+        echo "===== BASIC DNS CHECKS ====="
+        echo "[COMMAND] dig @$dns_server version.bind CHAOS TXT"
+        timeout 6 dig @"$dns_server" version.bind CHAOS TXT
+
+        echo
+        echo "[COMMAND] dig @$dns_server -x $dns_server"
+        timeout 6 dig @"$dns_server" -x "$dns_server"
+
+        echo
+        echo "[COMMAND] dig @$dns_server ANY ."
+        timeout 6 dig @"$dns_server" ANY .
+    } | tee -a "$loot_file"
+
+    # Try to infer domain from reverse DNS if one was not supplied
+    if [[ -z "$domain" ]]; then
+        domain="$(
+            dig @"$dns_server" -x "$dns_server" +short 2>/dev/null \
+            | sed 's/\.$//' \
+            | head -n 1
+        )"
+
+        if [[ -n "$domain" ]]; then
+            success "Inferred DNS name from PTR: ${GREEN}$domain${RESET}"
+            DNS_DOMAIN="$domain"
+            echo "$domain" >> "$DISCOVERED_HOSTS"
+            echo "$dns_server $domain" >> "$HOSTS_FILE"
+
+            # If PTR is host.domain.tld, also try base domain.
+            if [[ "$domain" == *.*.* ]]; then
+                local base_domain
+                base_domain="$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')"
+                if [[ -n "$base_domain" ]]; then
+                    note "Possible base domain: ${GREEN}$base_domain${RESET}"
+                    echo "$base_domain" >> "$DISCOVERED_HOSTS"
+                fi
+            fi
+        else
+            notify "Could not infer DNS domain from PTR"
+        fi
+    fi
+
+    if [[ -z "$domain" ]]; then
+        notify "No DNS domain known. Use --dns-domain=example.htb for deeper checks."
+        echo
+        lightbulb "Try discovering a domain from web headers, SMTP banner, SSL certs, or reverse DNS."
+        return 0
+    fi
+
+    DNS_DOMAIN="$domain"
+
+    echo
+    info "Querying common DNS records for ${CYAN}$domain${RESET}"
+    echo -e "  ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server $domain A${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server $domain NS${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server $domain MX${RESET}"
+    echo -e "     ${GREEN}dig @$dns_server $domain TXT${RESET}"
+
+    {
+        echo
+        echo "===== COMMON RECORDS FOR $domain ====="
+
+        for qtype in A AAAA NS MX TXT SOA CNAME SRV; do
+            echo
+            echo "[COMMAND] dig @$dns_server $domain $qtype"
+            timeout 6 dig @"$dns_server" "$domain" "$qtype"
+        done
+    } | tee -a "$loot_file"
+
+    # Save discovered hostnames from dig output
+    grep -Eio '([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}' "$loot_file" \
+        | sed 's/\.$//' \
+        | sort -u \
+        | tee "${outdir}/dns_hostnames_${dns_server}.txt" >/dev/null
+
+    while read -r host; do
+        [[ -z "$host" ]] && continue
+        echo "$host" >> "$DISCOVERED_HOSTS"
+        echo "$dns_server $host" >> "$HOSTS_FILE"
+    done < "${outdir}/dns_hostnames_${dns_server}.txt"
+
+    success "Saved discovered DNS names to ${outdir}/dns_hostnames_${dns_server}.txt"
+
+    if [[ "$DNS_AXFR" == true ]]; then
+        echo
+        info "Attempting DNS zone transfer for ${CYAN}$domain${RESET}"
+        echo -e "  ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        echo -e "     ${GREEN}dig axfr @$dns_server $domain${RESET}"
+
+        local axfr_file="${outdir}/axfr_${domain}_${dns_server}.txt"
+
+        timeout 10 dig axfr @"$dns_server" "$domain" | tee "$axfr_file" | tee -a "$loot_file" >/dev/null
+
+        if grep -qE 'IN[[:space:]]+(A|AAAA|CNAME|MX|NS|TXT|SOA)' "$axfr_file" && ! grep -qi 'Transfer failed' "$axfr_file"; then
+            DNS_ZONE_XFER_OK=true
+            high_risk "DNS zone transfer appears successful for ${domain}"
+            success "Saved AXFR output to $axfr_file"
+            DNS_AXFR_FILE="$axfr_file"
+
+            grep -Eio '([a-zA-Z0-9_-]+\.)+'"${domain//./\\.}" "$axfr_file" \
+                | sed 's/\.$//' \
+                | sort -u \
+                | tee "${outdir}/axfr_hosts_${domain}.txt" >/dev/null
+
+            while read -r host; do
+                [[ -z "$host" ]] && continue
+                echo "$host" >> "$DISCOVERED_HOSTS"
+                echo "$dns_server $host" >> "$HOSTS_FILE"
+            done < "${outdir}/axfr_hosts_${domain}.txt"
+
+            lightbulb "Add discovered hosts to /etc/hosts, then run web/vhost enumeration."
+        else
+            notify "Zone transfer failed or returned no useful records"
+        fi
+    fi
+
+    if [[ "$DNS_BRUTE" == true ]]; then
+        echo
+        info "Starting DNS brute force for ${CYAN}$domain${RESET}"
+
+        if [[ ! -f "$DNS_WORDLIST" ]]; then
+            warn "DNS wordlist not found: $DNS_WORDLIST"
+            lightbulb "Install SecLists or specify: --dns-wordlist=/path/to/list.txt"
+            return 0
+        fi
+
+        local brute_file="${outdir}/dns_brute_${domain}_${dns_server}.txt"
+
+        if command -v gobuster >/dev/null 2>&1; then
+            echo -e "  ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "  ${GREEN}gobuster dns -d $domain -r $dns_server -w $DNS_WORDLIST -o $brute_file${RESET}"
+
+            gobuster dns \
+                -d "$domain" \
+                -r "$dns_server" \
+                -w "$DNS_WORDLIST" \
+                -o "$brute_file" 2>&1 | tee -a "$loot_file"
+
+            grep -Eio 'Found: ([a-zA-Z0-9_-]+\.)+'"${domain//./\\.}" "$brute_file" 2>/dev/null \
+                | awk '{print $2}' \
+                | sort -u \
+                | tee "${outdir}/dns_brute_hosts_${domain}.txt" >/dev/null || true
+
+            while read -r host; do
+                [[ -z "$host" ]] && continue
+                echo "$host" >> "$DISCOVERED_HOSTS"
+                echo "$dns_server $host" >> "$HOSTS_FILE"
+            done < "${outdir}/dns_brute_hosts_${domain}.txt"
+
+            success "DNS brute-force results saved to $brute_file"
+
+        elif command -v ffuf >/dev/null 2>&1; then
+            notify "gobuster not found — using ffuf DNS brute style with Host header is not real DNS resolution."
+            lightbulb "Install gobuster for DNS brute force: sudo apt install gobuster"
+        else
+            warn "Neither gobuster nor suitable DNS brute tool found"
+            lightbulb "Install gobuster: sudo apt install gobuster"
+        fi
+    fi
+
+    echo
+    success "DNS enumeration complete"
+    success "DNS loot file: $loot_file"
+
+    echo
+    lightbulb "Useful next steps:"
+    echo -e "     ${GREEN}cat $outdir/dns_hostnames_${dns_server}.txt${RESET}"
+    echo -e "     ${GREEN}sort -u $DISCOVERED_HOSTS${RESET}"
+    echo -e "     ${GREEN}sort -u $HOSTS_FILE${RESET}"
 }
 
 
@@ -2353,6 +2979,22 @@ if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
     done
 fi
 
+# --------- DNS Checks (post-scan) ----------
+if grep -qx "53" "$OPEN_PORTS_FILE" 2>/dev/null; then
+    DNS_FOUND=true
+    success "Port 53 OPEN (DNS)"
+
+    if [[ "$ENABLE_DNS_ENUM" == true ]]; then
+        dns_enum "$TARGET_IPV4" "$DNS_DOMAIN"
+    else
+        alert "${BLUE}Tip:${RESET} DNS Service detected"
+        info "    — add ${BLUE}--dns-enum${RESET} to enable DNS deeper enum"
+        info "    — add ${BLUE}--dns-enum --dns-domain example.htb${RESET} "
+        info "    — add ${BLUE}--dns-brute --dns-domain example.htb${RESET} "
+        echo
+    fi
+fi
+
 # --------- FTP Checks (post-scan) ----------
 if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
     echo
@@ -2437,6 +3079,7 @@ if [ -s "$SMB_MARKER" ]; then
             # Optionally log for debugging
             echo -e "        ${YELLOW}(NTLM disabled: NT_STATUS_NOT_SUPPORTED)${RESET}" >&2
             NTLM_ENABLED=false
+			print_ntlm_kerberos_time_sync_note "$TARGET_IPV4"
             # Check for valid Kerberos 
             if [ -n "$ORIGINAL_HOSTNAME" ]; then
                 echo -e "        ${BLUE}(Attempting Kerberos fallback via netexec smb -k)${RESET}"
@@ -2823,6 +3466,20 @@ if [ -s "$SMB_MARKER" ]; then
     fi
 fi
 
+# Verify Creds can Access Domain Controller
+if  $CREDS_PROVIDED && [ $HAS_LDAP -eq 1 ]  ; then
+    if dc_auth_check "$AUTH_USER" "$AUTH_PASS" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$TARGET_IPV4"; then
+        echo
+        success "${GREEN}Credentials successfully authenticated to Domain Controller!${RESET}"
+        echo
+        DC_AUTH_OK=1
+    else
+        echo
+        warn "${RED}Credentials failed to authenticate to Domain Controller.${RESET}"
+        echo
+    fi
+fi
+
 # --------- LDAP Enumeration ----------
 if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     echo
@@ -2871,22 +3528,6 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "445"; then
         note "No credentials provided — skipping authenticated PsExec check"
     fi
 fi
-
-
-# Verify Creds can Access Domain Controller
-if  $CREDS_PROVIDED && [ $HAS_LDAP -eq 1 ]  ; then
-    if dc_auth_check "$AUTH_USER" "$AUTH_PASS" "${AUTH_DOMAIN:-$LDAP_DOMAIN}" "$TARGET_IPV4"; then
-        echo
-        success "${GREEN}Credentials successfully authenticated to Domain Controller!${RESET}"
-        echo
-        DC_AUTH_OK=1
-    else
-        echo
-        warn "${RED}Credentials failed to authenticate to Domain Controller.${RESET}"
-        echo
-    fi
-fi
-
 
 # --------- Kerberos Post-Scan Handling ----------
 if [ -s "$KERB_MARKER" ]; then
@@ -3156,71 +3797,147 @@ fi
 if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CREDS_PROVIDED" == true ]]; then
     echo
     target_ca=""
-    if command -v certipy-ad >/dev/null 2>&1; then
-        info "Checking for vulnerable AD CS certificate templates"
-        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}certipy-ad find -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -dc-ip '$TARGET_IPV4' -vulnerable${RESET}"
-    
-        CERTIPY_OUTPUT=$(certipy-ad find \
-            -u "${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}" \
-            -p "$AUTH_PASS" \
-            -dc-ip "$TARGET_IPV4" \
-            -vulnerable 2>&1)
-        CERTIPY_EXIT=$?
 
-        # Always display tool output
+    if command -v certipy-ad >/dev/null 2>&1; then
+        ADCS_DOMAIN="${AUTH_DOMAIN:-$LDAP_DOMAIN}"
+        ADCS_DOMAIN="${ADCS_DOMAIN,,}"
+        ADCS_USER_UPN="${AUTH_USER}@${ADCS_DOMAIN}"
+        CERTIPY_TARGET="$(get_preferred_dc_host "$TARGET_IPV4")"
+        CERTIPY_DATE_TAG=$(date +"%Y%m%d_%H%M%S")
+        CERTIPY_FILE="certipy_${TARGET_IPV4}_${CERTIPY_DATE_TAG}.txt"
+        CERTIPY_OUTPUT=""
+        CERTIPY_EXIT=1
+        CERTIPY_USED_KERB=false
+
+        info "Checking for vulnerable AD CS certificate templates"
+        if [[ "$NTLM_ENABLED" == false || "$KERBEROS_FOUND" == true || "$KERB_DETECTED" == true ]]; then
+    	    kerberos_ccache_reminder
+    	    create_local_kerberos_ccache
+	fi
+        note "Certipy target hostname: ${CERTIPY_TARGET}"
+        note "Certipy username: ${ADCS_USER_UPN}"
+
+        if [[ "$NTLM_ENABLED" == false ]]; then
+            CERTIPY_USED_KERB=true
+            print_ntlm_kerberos_time_sync_note "$CERTIPY_TARGET"
+
+            if certipy_prepare_kerberos "$ADCS_DOMAIN" "$CERTIPY_TARGET"; then
+                echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+                echo -e "        ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout -debug${RESET}"
+
+                set +e
+                CERTIPY_OUTPUT=$(certipy-ad find \
+                    -u "$ADCS_USER_UPN" \
+                    -k -no-pass \
+                    -target "$CERTIPY_TARGET" \
+                    -dc-ip "$TARGET_IPV4" \
+                    -enabled \
+                    -vulnerable \
+                    -stdout \
+                    -debug 2>&1)
+                CERTIPY_EXIT=$?
+                set -e
+            else
+                CERTIPY_OUTPUT="Certipy Kerberos preparation failed"
+                CERTIPY_EXIT=1
+            fi
+        else
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -p '$AUTH_PASS' -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout${RESET}"
+
+            set +e
+            CERTIPY_OUTPUT=$(certipy-ad find \
+                -u "$ADCS_USER_UPN" \
+                -p "$AUTH_PASS" \
+                -target "$CERTIPY_TARGET" \
+                -dc-ip "$TARGET_IPV4" \
+                -enabled \
+                -vulnerable \
+                -stdout 2>&1)
+            CERTIPY_EXIT=$?
+            set -e
+
+            # If NTLM/password bind fails because NTLM is disabled, automatically retry with Kerberos.
+            if echo "$CERTIPY_OUTPUT" | grep -qiE 'NTLM negotiate failed|STATUS_NOT_SUPPORTED|NTLM.*disabled|AcceptSecurityContext error'; then
+                notify "Certipy password/NTLM bind failed; retrying AD CS check with Kerberos"
+                NTLM_ENABLED=false
+                CERTIPY_USED_KERB=true
+                print_ntlm_kerberos_time_sync_note "$CERTIPY_TARGET"
+
+                if certipy_prepare_kerberos "$ADCS_DOMAIN" "$CERTIPY_TARGET"; then
+                    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+                    echo -e "        ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout -debug${RESET}"
+
+                    set +e
+                    CERTIPY_OUTPUT=$(certipy-ad find \
+                        -u "$ADCS_USER_UPN" \
+                        -k -no-pass \
+                        -target "$CERTIPY_TARGET" \
+                        -dc-ip "$TARGET_IPV4" \
+                        -enabled \
+                        -vulnerable \
+                        -stdout \
+                        -debug 2>&1)
+                    CERTIPY_EXIT=$?
+                    set -e
+                fi
+            fi
+        fi
+
+        # Always display and save Certipy output. This avoids false "no vuln" results when no Certipy file is generated.
         echo "$CERTIPY_OUTPUT"
         echo
+        printf "%s\n" "$CERTIPY_OUTPUT" > "$CERTIPY_FILE"
+        info "Certipy results saved to: ${BYELLOW}$CERTIPY_FILE${RESET}"
 
-        # -------- Credential failure detection --------
-        if echo "$CERTIPY_OUTPUT" | grep -qiE 'invalidCredentials|data 52e|authentication failed'; then
-            error "Invalid domain credentials supplied"
+        # -------- Common Kerberos / credential failure hints --------
+        if echo "$CERTIPY_OUTPUT" | grep -qiE 'KRB_AP_ERR_SKEW|Clock skew'; then
+            error "Kerberos clock skew detected during AD CS enumeration"
+            lightbulb "Kerberos requires time sync (usually within five minutes)"
+            echo -e "    ${GREEN}sudo ntpdate -u '$CERTIPY_TARGET'${RESET}"
+            echo -e "    ${GREEN}while true; do sudo ntpdate -u '$CERTIPY_TARGET'; sleep 2; done${RESET}"
+        fi
+
+        if echo "$CERTIPY_OUTPUT" | grep -qiE 'KDC_ERR_S_PRINCIPAL_UNKNOWN|Server not found in Kerberos database'; then
+            error "Kerberos SPN/target mismatch during AD CS enumeration"
+            lightbulb "Use the DC FQDN with Certipy Kerberos, not only the IP"
+            echo -e "    ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -vulnerable -stdout -debug${RESET}"
+        fi
+
+        if echo "$CERTIPY_OUTPUT" | grep -qiE 'KRB5CCNAME environment variable not set|CCache file is not found|No Kerberos credentials available'; then
+            error "Kerberos ccache missing for Certipy"
+            lightbulb "Create one manually:"
+            echo -e "    ${GREEN}export KRB5CCNAME=\"\$PWD/${AUTH_USER}.ccache\"${RESET}"
+            echo -e "    ${GREEN}kinit '${AUTH_USER}@${ADCS_DOMAIN^^}'${RESET}"
+            echo -e "    ${GREEN}klist${RESET}"
+        fi
+
+        if echo "$CERTIPY_OUTPUT" | grep -qiE 'invalidCredentials|data 52e|KDC_ERR_PREAUTH_FAILED'; then
+            error "Invalid domain credentials supplied or Kerberos pre-auth failed"
             lightbulb "Verify username/password"
             lightbulb "Confirm domain format: user@domain"
-            lightbulb "Try manual bind: ldapwhoami -x -D ${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN} -W -H ldap://$TARGET_IPV4"
+            lightbulb "Try manual Kerberos: kinit '${AUTH_USER}@${ADCS_DOMAIN^^}'"
             ADCS_SERVICE_DETECTED=true
         fi
-        # -------- Clock Skew Detection --------
-        if echo "$CERTIPY_OUTPUT" | grep -qi "KRB_AP_ERR_SKEW"; then
-            error "Kerberos clock skew detected during AD CS enumeration"
-
-            lightbulb "Kerberos requires time sync (±5 minutes)"
-            lightbulb "Fix on Kali:"
-            echo "    sudo ntpdate -u $TARGET_IPV4"
-            echo "       OR"
-            echo "    sudo timedatectl set-ntp true"
-
-            info "Certipy may still enumerate templates, but Kerberos-based abuse may fail"
-       fi
-
 
         if [[ $CERTIPY_EXIT -ne 0 ]]; then
-            warn "Certipy execution failed"
+            warn "Certipy execution failed — not marking AD CS as clean"
             info "Continuing — AD CS detection is optional"
         else
             ADCS_SERVICE_DETECTED=true
-            
-            # Detect Certipy output file
-            CERTIPY_FILE=$(echo "$CERTIPY_OUTPUT" | grep -oE '[0-9]{14}_Certipy.txt' | head -n1)
-
-            if [[ -z "$CERTIPY_FILE" || ! -f "$CERTIPY_FILE" ]]; then
-                warn "Certipy Did Not Generate an Output File"
-            fi
-
-            info "Certipy Results Saved to: ${BYELLOW}$CERTIPY_FILE${RESET}"
 
             # -------- Vulnerability detection --------
             if grep -qiE 'ESC[0-9]+' "$CERTIPY_FILE"; then
                 ADCS_VULNERABLE=true
                 alert "VULNERABLE Active Directory Certificate Services detected"
-                
+
                 # Extract CA Names from Certipy output
                 mapfile -t ADCS_CA_NAMES < <(
                     grep -iE '^\s*CA Name\s*:' "$CERTIPY_FILE" \
                     | awk -F ':' '{gsub(/^[ \t]+/, "", $2); print $2}' \
                     | sort -u
                 )
-                
+
                 if [[ ${#ADCS_CA_NAMES[@]} -gt 0 ]]; then
                     success "Certificate Authority detected:"
                     for ca in "${ADCS_CA_NAMES[@]}"; do
@@ -3232,6 +3949,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                     ADCS_CA_PRESENT=true
                 else
                     warn "No Certificate Authority name found in Certipy output"
+                    target_ca="<CA_NAME>"
                 fi
 
                 # -------- Extract ESC identifiers --------
@@ -3246,9 +3964,12 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                         case "$esc" in
                             ESC1|ESC4)
                                  echo -e "    ${RED}${esc}${RESET}  →  ${RED}CRITICAL${RESET}  (10/10)"
-                                 echo -e "        ${YELLOW}Instant privilege escalation via certificate enrollment${RESET}"
-                                 echo -e "        Exploit Command: "
-                                 echo -e "          ${GREEN}certipy req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip '${TARGET_IPV4}' -target '[CA].${AUTH_DOMAIN:-$LDAP_DOMAIN}' -ca '${target_ca}' -upn 'administrator@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -sid '[admin_sid]' -dns ${AUTH_DOMAIN:-$LDAP_DOMAIN} -debug${RESET}"
+                                 echo -e "        ${YELLOW}Privilege escalation via certificate enrollment / template control${RESET}"
+                                 ;;
+                            ESC13)
+                                 echo -e "    ${RED}${esc}${RESET} →  ${RED}HIGH/CRITICAL${RESET}  (9/10)"
+                                 echo -e "        Issuance policy can map the requester into a linked privileged group"
+                                 echo -e "        Check for msDS-OIDToGroupLink / linked group abuse"
                                  ;;
                             ESC2|ESC3)
                                  echo -e "    ${YELLOW}${esc}${RESET} →  ${YELLOW}HIGH${RESET}      (8/10)"
@@ -3270,13 +3991,13 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                 else
                     warn "Vulnerability detected but ESC identifier could not be parsed"
                 fi
-    
+
                 mapfile -t ADCS_TEMPLATES < <(
                     grep -iE 'Template Name|Template:' "$CERTIPY_FILE" \
                     | sed -E 's/.*(Template Name|Template):\s*//I' \
                     | sort -u
                 )
-		
+
                 if [[ ${#ADCS_TEMPLATES[@]} -gt 0 ]]; then
                     success "Vulnerable certificate templates identified:"
                     for template in "${ADCS_TEMPLATES[@]}"; do
@@ -3287,15 +4008,29 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                 fi
 
                 lightbulb "Next steps (manual exploitation):"
-                echo -e "    certipy-ad req -u '${AUTH_USER}@${AUTH_DOMAIN:-$LDAP_DOMAIN}' -p '$AUTH_PASS' -template <TEMPLATE> -dc-ip $TARGET_IPV4"
-                echo -e "    certipy-ad auth -pfx user.pfx"
+                if [[ "$CERTIPY_USED_KERB" == true ]]; then
+                    note "Before Certipy Kerberos requests, make sure a local ccache exists:"
+		    echo -e "        ${GREEN}sudo ntpdate -u dc1.ping.htb${RESET}"
+		    echo -e "        ${GREEN}impacket-getTGT '${LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}' -dc-ip '${TARGET_IPV4}'${RESET}"
+		    echo -e "        ${GREEN}export KRB5CCNAME=\"\$(pwd)/${AUTH_USER}.ccache\"${RESET}"
+		    echo -e "        ${GREEN}klist${RESET}"
+		    echo ""
+                    echo -e "    ${GREEN}certipy-ad req -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -dc-host '${TARGET_IPV4}' -ca '${target_ca}' -template '<TEMPLATE>'${RESET}"
+                else
+                    echo -e "    ${GREEN}certipy-ad req -u '${ADCS_USER_UPN}' -p '$AUTH_PASS' -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -dc-host '${TARGET_IPV4}' -ca '${target_ca}' -template '<TEMPLATE>'${RESET}"
+                fi
+                echo -e "    ${GREEN}certipy-ad auth -pfx user.pfx -domain '${ADCS_DOMAIN}' -dc-ip '${TARGET_IPV4}'${RESET}"
 
             else
-                success "No vulnerable certificate templates detected"
+                success "No vulnerable certificate templates detected by Certipy"
+                if [[ "$CERTIPY_USED_KERB" == true ]]; then
+                    lightbulb "For ESC13/issuance-policy review, also inspect all enabled templates:"
+                    echo -e "    ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -stdout -debug | grep -Ei 'ESC13|Issuance Policies|msDS-OIDToGroupLink|Linked Group|TemporaryWinRM|Enrollment Rights' -A 20 -B 10${RESET}"
+                fi
             fi
         fi
     else
-    	warn "AD CS check skipped — certipy-ad not installed"
+        warn "AD CS check skipped — certipy-ad not installed"
         lightbulb "Install with: pipx install certipy-ad"
     fi
 elif [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == false ]]; then
@@ -3311,7 +4046,6 @@ elif [[ "$ENABLE_ADCS" == true && "$HAS_LDAP" -eq 0 ]]; then
     warn "AD CS check skipped — LDAP port not accessible"
     echo -e "   - Required ports: 389 (LDAP) or 636 (LDAPS) and 88 (Kerberos)"
 fi
-
 
 ########################################
 # Perform Attack: Kerberoast
@@ -3572,6 +4306,12 @@ elif ! $ENABLE_VHOST && [ -s "$DISCOVERED_HOSTS" ] && [ $HAS_WEB -eq 1 ] && comm
     alert "${BLUE}Tip:${RESET} Web Service detected and Hosts were discovered"
     info "    — add ${BLUE}--vhost${RESET} to enable vhost fuzzing"
     echo
+    alert "${BLUE}Tip:${RESET} MANUAL Check"
+    if [[ -n "$DNS_DOMAIN" ]]; then
+        info "    — ${BLUE}python3 vhost_ffuf.py -i $TARGET_IPV4 -d $DNS_DOMAIN ${RESET}"
+    else
+        info "    — ${BLUE}python3 vhost_ffuf.py -i $TARGET_IPV4 -d 'target_host_domain'${RESET}"
+    fi
 fi
 
 # ---------- /etc/hosts suggestions ----------
@@ -3658,6 +4398,48 @@ generate_synopsis() {
             found_any=true
         fi
     }
+    
+    if [[ "$DNS_FOUND" == true ]]; then
+        echo -e "\n ${CYAN}DNS SERVICE${RESET}"
+        echo -e " --------------------------------------"
+        info "DNS Summary"
+
+        if [[ -n "$DNS_DOMAIN" ]]; then
+            echo -e "    Domain: ${GREEN}$DNS_DOMAIN${RESET}"
+        fi
+
+        if [[ "$DNS_ENUM_DONE" == true ]]; then
+            echo
+            print_item "$DNS_ENUM_DONE" "DNS Enumeration Loot"
+            echo -e "  Loot: ${GREEN}$DNS_LOOT_FILE${RESET}"
+        fi
+        
+        if [[ "$DNS_ZONE_XFER_OK" == true ]]; then
+            echo
+            print_item "$DNS_ZONE_XFER_OK" "Zone transfer succeeded — review discovered hosts and add them to /etc/hosts"
+    	    #high_risk "Zone transfer succeeded — review discovered hosts and add them to /etc/hosts"
+
+    	    if [[ -n "${DNS_AXFR_FILE:-}" && -f "${DNS_AXFR_FILE:-}" ]]; then
+                high_risk "AXFR output file: ${GREEN}${DNS_AXFR_FILE}${RESET}"
+
+                echo
+                info "AXFR preview:"
+                sed -n '1,40p' "$DNS_AXFR_FILE"
+            else
+                warn "AXFR succeeded, but variable 'DNS_AXFR_FILE' was not found or not set!"
+            fi
+	fi
+
+        lightbulb "Manual DNS commands:"
+        echo -e "     ${GREEN}dig @$TARGET_IPV4 -x $TARGET_IPV4${RESET}"
+
+        if [[ -n "$DNS_DOMAIN" ]]; then
+            echo -e "     ${GREEN}dig axfr @$TARGET_IPV4 $DNS_DOMAIN${RESET}"
+            echo -e "     ${GREEN}gobuster dns -d $DNS_DOMAIN -r $TARGET_IPV4 -w $DNS_WORDLIST${RESET}"
+        else
+            echo -e "     ${GREEN}dig @$TARGET_IPV4 ANY .${RESET}"
+        fi
+    fi
 
     # 1. Active Directory / Kerberos
     
@@ -3807,7 +4589,8 @@ attack_path_evaluation() {
     fi
     
     # 5. RBCD candidate (needs MAQ + writable ACLs later)
-    if [[ "$MAQ_ENABLED" == true && "$HAS_WRITABLE_COMPUTER_ACL" == true ]]; then
+    #if [[ "$MAQ_ENABLED" == true && "$HAS_WRITABLE_COMPUTER_ACL" == true ]]; then
+    if [[ "$MAQ_ENABLED" == true ]]; then
         ATTACK_PATHS+=("RBCD via MAQ")
         critical "Attack Path: Resource-Based Constrained Delegation candidate"
         lightbulb "Next Steps:"
@@ -3919,7 +4702,6 @@ attack_path_evaluation() {
 
 # Generate Attack Path Summary
 attack_path_evaluation
-
 
 # --------- Recon Summary & Next Steps ----------
 echo

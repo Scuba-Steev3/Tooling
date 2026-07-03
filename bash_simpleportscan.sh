@@ -1,40 +1,132 @@
 #!/bin/bash
-# ==============================
-# Pro Bash Recon & Port Scanner
-# Features:
-# - Multi-port scan
-# - SSL CN/SAN extraction
-# - HTTP redirect handling (multi)
-# - VHost fuzzing with discovered hosts
-# - Basic service checks: FTP, SMB, Docker, Redis, K8S
-# - Perform Bloodhound export
-# - Perform Kerberoast
-# - /etc/hosts suggestions
-# - Recon summary with next steps
-# ==============================
 
-###################### TODO #########################
-# Fix Bash Concurrency Safety (CRITICAL)
+# ==============================================================================
+# Bash Recon and Service Enumeration Helper
 #
-# Add --top-ports / --full Scan Modes
-#     --top-ports     current list (default)
-#     --full          add common high ports
-#     --web           web-only ports
+# Purpose:
+#   Perform a bounded-concurrency TCP connect scan against a curated service
+#   profile, then run optional service-specific enumeration and produce
+#   evidence-based findings and suggested next steps.
 #
-# Structured Output Sections (Readability)
+# Implemented capabilities:
+#   - Concurrent TCP connect scanning of common infrastructure and AD ports
+#   - Optional Nmap service, version, script, and OS detection
+#   - Reverse-DNS, LDAP RootDSE, TLS SAN, and HTTP redirect hostname discovery
+#   - HTTP/HTTPS redirect analysis, directory enumeration, and VHost discovery
+#   - DNS enumeration, AXFR testing, and optional subdomain brute forcing
+#   - FTP, SMB, RPC, LDAP/LDAPS, Kerberos, MSSQL, NFS, Docker, Redis,
+#     Kubernetes, RDP, WinRM, database, and printer-service checks
+#   - Anonymous, guest, and authenticated SMB/LDAP access validation
+#   - Optional AS-REP Roasting and Kerberoasting assessment
+#   - Optional BloodHound data collection
+#   - Optional Active Directory Certificate Services assessment with Certipy
+#   - /etc/hosts suggestions, evidence files, recon synopsis, and attack-path
+#     hints
 #
-# CVE Hints → MITRE ATT&CK Mapping
-#  Port 445 → SMB relay
-#    ATT&CK: T1557, T1021.002
-#
-# Auto-Suggest Exploitation Paths (Still Safe)
-#  [SMB + LDAP + Kerberos]
-#    → Likely Active Directory
-#    → Try AS-REP roast → SMB → WinRM
-#
-# Align output with OSCP-style methodology
-#######################################################
+# Safety:
+#   Intended only for systems that you own or are explicitly authorized to test.
+#   Potentially intrusive or credentialed checks should remain opt-in.
+# ==============================================================================
 
+# ==============================================================================
+# TODO / ROADMAP
+# ==============================================================================
+#
+# P0 - Correctness and Credential Safety
+# --------------------------------------
+# - Fix extract_ssl_info variable mismatch:
+#     local PORT=...
+#     if [[ "$PORT" -eq 636 ]]; then
+# - Either implement certificate CN extraction or document SAN-only extraction.
+# - Separate observed facts from inferred risks:
+#     OPEN       Port is reachable
+#     CONFIRMED  A probe verified a configuration or exposure
+#     POSSIBLE   Manual validation is still required
+# - Do not label a service vulnerable based only on its port number.
+# - Make --no-color disable every color and formatting variable.
+#
+# P1 - Argument Parsing and Scan Profiles
+# ---------------------------------------
+# - Replace the current manual argument parser with getopt or a dedicated
+#   parse_args function supporting --help and input validation.
+# - Add explicit scan profiles:
+#     --profile default     Current curated service list
+#     --profile web         Web and common alternate-web ports
+#     --profile ad          AD, Kerberos, SMB, RPC, LDAP, DNS, and AD CS ports
+#     --profile extended    Default profile plus common high ports
+# - Avoid a --web scan flag that could be confused with the existing
+#   --web-enum enumeration flag.
+#
+# P1 - Concurrency Hardening
+# --------------------------
+# - Track every worker PID and collect individual exit statuses.
+# - Replace concurrent terminal writes with per-job output files or a result
+#   queue, then print results deterministically after wait.
+# - Use per-worker result files or locking for shared evidence files.
+# - Deduplicate every shared result file after worker completion.
+# - Handle SIGINT, SIGTERM, and partial-run cleanup consistently.
+# - Make concurrency configurable:
+#     --jobs N
+#     --connect-timeout SECONDS
+# - Add tests for interrupted jobs, failed probes, duplicate results, and
+#   malformed targets.
+#
+# P1 - Reporting and Evidence
+# ---------------------------
+# - Normalize output sections:
+#     Target and scope
+#     Open ports
+#     Confirmed findings
+#     Authentication results
+#     Collected evidence
+#     Possible attack paths
+#     Manual next steps
+#     Errors and skipped checks
+# - Add machine-readable output:
+#     --output-dir DIR
+#     --format text|json|jsonl
+# - Attach evidence and confidence to each finding.
+# - Keep sensitive evidence outside the repository by default.
+#
+# P1 - Attack-Path Decision Engine
+# --------------------------------
+# - Generate paths only from verified prerequisites, not port combinations.
+# - Add confidence levels and missing prerequisites to every suggestion.
+# - Avoid claiming that an attack is viable solely because a hash, SPN, or
+#   service port was found.
+# - Distinguish:
+#     discovery opportunity
+#     credential-access opportunity
+#     authenticated remote-service opportunity
+#     privilege-escalation opportunity
+# - Require explicit confirmation before running intrusive actions.
+#
+# P2 - CVE and MITRE ATT&CK Mapping
+# ---------------------------------
+# - Rename static "CVE hints" to "attack-surface hints."
+# - Show a CVE only when service/version/configuration evidence matches.
+# - Include the evidence that caused each mapping.
+# - Map confirmed behavior rather than open ports:
+#     SMB relay/name-resolution poisoning  -> T1557.001
+#     SMB admin-share remote access        -> T1021.002
+#     WinRM remote access                  -> T1021.006
+#     Kerberoasting                        -> T1558.003
+#     AS-REP Roasting                      -> T1558.004
+# - Keep ATT&CK mappings in a data structure rather than scattered strings.
+#
+# P2 - Assessment Workflow
+# ------------------------
+# - Organize the final workflow as:
+#     discovery
+#     service enumeration
+#     authentication validation
+#     vulnerability validation
+#     evidence collection
+#     attack-path analysis
+#     cleanup and reporting
+# - Avoid branding the output as "OSCP-style"; 
+#
+# ==============================================================================
 
 set -euo pipefail
 

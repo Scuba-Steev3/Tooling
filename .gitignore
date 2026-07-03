@@ -1,0 +1,88 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python caches, environments, and build output
+__pycache__/
+*.py[cod]
+*.pyd
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+credentials/
+
+# Certificates, private keys, and Kerberos material
+*.pfx
+*.p12
+*.key
+*.pem
+*.ccache
+krb5cc_*
+*.kirbi
+*.kdbx
+
+# Credential, password, and hash material
+hash_*.txt
+hashes.txt
+valid_*_creds.txt
+credentials*.txt
+users.txt
+usernames.txt
+passwords.txt
+passwd.txt
+
+# Recon and scanner output
+nmap_service_*.txt
+nmap_service_*.screen.txt
+*.gnmap
+nmap_*.xml
+scan_*.xml
+ffuf_*.html
+ffuf-results/
+lfi_loot/
+loot/
+reports/
+results/
+output/
+logs/
+*.log
+*.jsonl
+ldap_shell_output.txt
+
+# Active Directory, BloodHound, SMB, DNS, and NFS output
+*_bloodhound.zip
+bloodhound_*/
+users_smb_*.txt
+smb_user_descriptions.txt
+user_groups_*.csv
+user_groups_*.txt
+dns_loot_*
+dns_axfr_*
+nfs_exports_*
+nfs_loot_*/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/

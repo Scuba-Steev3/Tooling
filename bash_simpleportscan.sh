@@ -123,6 +123,14 @@ DNS_FOUND=false
 DNS_ZONE_XFER_OK=false
 DNS_LOOT_FILE=""
 DNS_AXFR_FILE=""
+ENABLE_SERVICE_DETECT=false
+NFS_FOUND=false
+NFS_ENUM_DONE=false
+NFS_EXPORTS_FOUND=false
+NFS_WORLD_EXPORT=false
+NFS_EXPORTS_FILE=""
+NFS_LOOT_DIR=""
+
 
 # --------- Certificate Services / AD CS ----------
 HAS_CERTIPY=0
@@ -196,6 +204,8 @@ for arg in "$@"; do
         --check-ca) ENABLE_ADCS=true ;;
         --check-mssql) ENABLE_MSSQL_ENUM=true ;;
         --mssql-brute) ENABLE_MSSQL_BRUTE=true ;;
+        --service-detect) ENABLE_SERVICE_DETECT=true ;;
+	--svc) ENABLE_SERVICE_DETECT=true ;;
         --dns-enum) ENABLE_DNS_ENUM=true ;;
         --dns-brute) ENABLE_DNS_ENUM=true DNS_BRUTE=true ;;
         --dns-no-axfr) DNS_AXFR=false;;
@@ -290,6 +300,49 @@ lightbulb() { echo -e "${YELLOW}${ICON_TIP} ${RESET} $*"; }
 
 is_ipv4() {
     [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+service_version_detection() {
+    local target="$1"
+    local ports_csv
+
+    if ! command -v nmap >/dev/null 2>&1; then
+        warn "nmap not found — skipping service/version detection"
+        return 1
+    fi
+
+    if [ ! -s "$OPEN_PORTS_FILE" ]; then
+        warn "No open ports available for service/version detection"
+        return 1
+    fi
+
+    ports_csv=$(sort -n "$OPEN_PORTS_FILE" | paste -sd, -)
+
+    echo
+    echo -e "${BLUE}========================================${RESET}"
+    echo -e "${BYELLOW} Service / Version / OS Detection ${RESET}"
+    echo -e "${BLUE}========================================${RESET}"
+
+    info "Running targeted nmap service detection against open ports only"
+    echo -e " ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e " ${GREEN}nmap -sC -sV -O --osscan-guess -p $ports_csv $target${RESET}"
+
+    nmap -sC -sV -O --osscan-guess -p "$ports_csv" "$target" \
+        -oN "nmap_service_${target}.txt" \
+        2>/dev/null | tee "nmap_service_${target}.screen.txt"
+
+    echo
+    success "Saved full nmap output to: nmap_service_${target}.txt"
+
+    echo
+    info "Parsed service summary:"
+    awk '
+        /^PORT[[:space:]]+STATE[[:space:]]+SERVICE/ {print; show=1; next}
+        show && /^[0-9]+\/tcp[[:space:]]+open/ {print}
+        /^Service Info:/ {print}
+        /^OS details:/ {print}
+        /^Aggressive OS guesses:/ {print}
+    ' "nmap_service_${target}.txt"
 }
 
 get_preferred_dc_host() {
@@ -2697,6 +2750,178 @@ dns_enum() {
     echo -e "     ${GREEN}sort -u $HOSTS_FILE${RESET}"
 }
 
+# --------- NFS Enumeration ----------
+enumerate_nfs() {
+    set +e  # Disable exit-on-error for this function
+    local target="${1:?NFS target required}"
+    local outdir="nfs_${target}"
+    local rpc_file="${outdir}/rpcinfo.txt"
+    local exports_raw="${outdir}/showmount_exports.txt"
+    local exports_clean="${outdir}/exports.txt"
+    local nmap_file="${outdir}/nmap_nfs.txt"
+    local rpc_out=""
+    local showmount_out=""
+    local export_path=""
+    local export_acl=""
+    local safe_name=""
+
+    NFS_ENUM_DONE=true
+    NFS_LOOT_DIR="$outdir"
+    NFS_EXPORTS_FILE="$exports_clean"
+
+    mkdir -p "$outdir"
+
+    echo
+    echo -e "${BLUE}========================================${RESET}"
+    echo -e "${BYELLOW} NFS / RPC Enumeration ${RESET}"
+    echo -e "${BLUE}========================================${RESET}"
+    info "Running non-destructive NFS checks against ${CYAN}${target}${RESET}"
+
+    # RPC program discovery is useful because mountd, nlockmgr, and status
+    # commonly listen on dynamic high ports.
+    if command -v rpcinfo >/dev/null 2>&1; then
+        echo -e " ${YELLOW}${ICON_TIP} Copy/Paste:${RESET}"
+        echo -e " ${GREEN}rpcinfo -p '$target'${RESET}"
+
+        rpc_out="$(timeout 8 rpcinfo -p "$target" 2>&1 || true)"
+        printf '%s\n' "$rpc_out" | tee "$rpc_file"
+
+        if printf '%s\n' "$rpc_out" \
+            | grep -Eqi '(^|[[:space:]])100003([[:space:]]|$)|(^|[[:space:]])nfs([[:space:]]|$)'; then
+            NFS_FOUND=true
+            success "NFS RPC program detected"
+        fi
+
+        if printf '%s\n' "$rpc_out" | grep -Eqi 'mountd|100005'; then
+            success "RPC mountd detected"
+        fi
+    else
+        warn "rpcinfo not installed"
+        lightbulb "Install the NFS client utilities: sudo apt install nfs-common"
+    fi
+
+    # NFSv4 may expose TCP/2049 without disclosing mountd through RPCBind.
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx '2049'; then
+        NFS_FOUND=true
+    fi
+
+    # showmount primarily applies to NFSv2/v3.
+    if command -v showmount >/dev/null 2>&1; then
+        echo
+        echo -e " ${YELLOW}${ICON_TIP} Copy/Paste:${RESET}"
+        echo -e " ${GREEN}showmount -e '$target'${RESET}"
+
+        showmount_out="$(timeout 8 showmount -e "$target" 2>&1 || true)"
+        printf '%s\n' "$showmount_out" | tee "$exports_raw"
+
+        printf '%s\n' "$showmount_out" \
+            | awk '
+                NR > 1 && $1 ~ /^\// {
+                    path=$1
+                    $1=""
+                    sub(/^[[:space:]]+/, "", $0)
+                    print path "\t" $0
+                }
+            ' > "$exports_clean"
+    else
+        warn "showmount not installed"
+        lightbulb "Install it with: sudo apt install nfs-common"
+        : > "$exports_clean"
+    fi
+
+    if [[ -s "$exports_clean" ]]; then
+        NFS_EXPORTS_FOUND=true
+        high_risk "NFS exports are remotely visible"
+        success "Clean export list saved to: ${BYELLOW}${exports_clean}${RESET}"
+
+        while IFS=$'\t' read -r export_path export_acl; do
+            [[ -z "$export_path" ]] && continue
+
+            echo
+            echo -e " ${CYAN}${ICON_SHARE} Export:${RESET} ${BYELLOW}${export_path}${RESET}"
+            echo -e "   Allowed clients: ${export_acl:-unknown}"
+
+            if [[ "${export_acl:-}" == "*" ]] \
+                || printf '%s\n' "${export_acl:-}" \
+                    | grep -Eqi 'everyone|\(everyone\)|world'; then
+                NFS_WORLD_EXPORT=true
+                critical "World-accessible NFS export: ${export_path}"
+            fi
+
+            safe_name="$(
+                printf '%s' "$export_path" \
+                    | sed 's#^/##; s#[^[:alnum:]_.-]#_#g'
+            )"
+
+            [[ -z "$safe_name" ]] && safe_name="root"
+
+            echo -e " ${YELLOW}${ICON_TIP} Read-only mount attempts:${RESET}"
+
+            echo -e \
+                " ${GREEN}sudo mkdir -p '/mnt/nfs_${safe_name}'${RESET}"
+
+            echo -e \
+                " ${GREEN}sudo mount -t nfs -o ro,nosuid,nodev,noexec,nolock,vers=3 '${target}:${export_path}' '/mnt/nfs_${safe_name}'${RESET}"
+
+            echo -e \
+                " ${GREEN}sudo mount -t nfs4 -o ro,nosuid,nodev,noexec '${target}:${export_path}' '/mnt/nfs_${safe_name}'${RESET}"
+
+            echo -e \
+                " ${GREEN}ls -lan '/mnt/nfs_${safe_name}'${RESET}"
+
+            echo -e \
+                " ${GREEN}find '/mnt/nfs_${safe_name}' -xdev -maxdepth 3 -printf '%M %u:%g %s %TY-%Tm-%Td %TH:%TM %p\\n' 2>/dev/null${RESET}"
+
+        done < "$exports_clean"
+
+        ATTACK_PATHS+=(
+            "NFS exports exposed: inspect backups, home directories, web roots, SSH material, configuration files, and numeric UID/GID ownership"
+        )
+    else
+        notify "showmount returned no export list"
+        note "This does not exclude NFSv4. Review rpcinfo/Nmap output and test an NFSv4 pseudo-root manually."
+
+        echo -e " ${YELLOW}${ICON_TIP} NFSv4 probe:${RESET}"
+        echo -e \
+            " ${GREEN}sudo mkdir -p /mnt/nfs4_root${RESET}"
+
+        echo -e \
+            " ${GREEN}sudo mount -t nfs4 -o ro,nosuid,nodev,noexec '${target}:/' /mnt/nfs4_root${RESET}"
+    fi
+
+    # Nmap provides a second source of NFS/RPC evidence.
+    if command -v nmap >/dev/null 2>&1; then
+        echo
+        info "Running Nmap NFS/RPC scripts"
+
+        echo -e " ${YELLOW}${ICON_TIP} Copy/Paste:${RESET}"
+        echo -e \
+            " ${GREEN}nmap -Pn -sT -p111,2049 --script=rpcinfo,nfs-showmount,nfs-ls,nfs-statfs '$target'${RESET}"
+
+        timeout 60 nmap -Pn -sT \
+            -p111,2049 \
+            --script=rpcinfo,nfs-showmount,nfs-ls,nfs-statfs \
+            "$target" \
+            -oN "$nmap_file" \
+            >/dev/null 2>&1 || true
+
+        if [[ -s "$nmap_file" ]]; then
+            cat "$nmap_file"
+            success "Nmap NFS output saved to: ${BYELLOW}${nmap_file}${RESET}"
+        else
+            notify "Nmap NFS scripts returned no saved output"
+        fi
+    fi
+
+    if [[ "$NFS_FOUND" == true ]]; then
+        echo
+        lightbulb "NFS review priorities:"
+        echo "  → Keep the first mount read-only"
+        echo "  → Use ls -lan to preserve numeric UID/GID evidence"
+        echo "  → Look for .ssh, backups, web roots, .env files, configs, mail, cron scripts, and database dumps"
+        echo "  → Treat writable exports and no_root_squash as high-risk, but validate before changing files"
+    fi
+}
 
 # -------------------------------------------------------
 # ------------------------ START ------------------------
@@ -2724,6 +2949,7 @@ PORTS=(
     "636:LDAPS:interesting"
     "993:IMAPS:interesting"
     "1433:SQL Server:high"
+    "2049:Network File System:high"
     "2375:Docker API:high"
     "2377:Docker Swarm:interesting"
     "3000:Web Dev:interesting"
@@ -2751,6 +2977,7 @@ declare -A CVE_HINTS=(
   [53]="Zone transfer (AXFR), DNS recursion"
   [80]="Web vulns: file upload, auth bypass, outdated CMS"
   [88]="Kerberos roasting, AD misconfig, pre-auth disabled"
+  [111]="RPC program discovery, NFS/mountd enumeration, and dynamic RPC services"
   [110]="Cleartext POP3, weak creds"
   [139]="SMB NULL session, EternalBlue class issues"
   [389]="Anonymous LDAP bind, domain info disclosure"
@@ -2758,6 +2985,7 @@ declare -A CVE_HINTS=(
   [445]="SMB relay, signing disabled, MS17-010"
   [631]="CUPS info leak, printer RCE class issues"
   [1433]="MSSQL auth abuse, xp_cmdshell exposure"
+  [2049]="Exposed NFS exports, weak client restrictions, UID/GID trust, sensitive backups, or SSH keys"
   [2375]="Unauth Docker API → container escape risk"
   [3000]="Dev panels, default creds, debug mode"
   [3306]="Weak DB creds, data exposure"
@@ -2840,6 +3068,7 @@ for ENTRY in "${PORTS[@]}"; do # ---- MAX_JOBS throttle ----
         88) echo "KERBEROS" >> "$HINT_FILE" ; echo "$PORT" >> "$KERB_MARKER" ;;
         389|636) echo "LDAP" >> "$HINT_FILE" ; echo "$PORT" >> "$LDAP_MARKER" ;;
         6379) echo "REDIS" >> "$HINT_FILE" ;;
+        2049) echo "NFS" >> "$HINT_FILE" ;;
         2375) echo "DOCKER" >> "$HINT_FILE" ;;
         6443) echo "K8S" >> "$HINT_FILE" ;;
         3389) echo "RDP" >> "$HINT_FILE" ;;
@@ -2917,6 +3146,11 @@ HAS_KERB=$(grep -q KERBEROS "$HINT_FILE" && echo 1 || echo 0)
 OPEN_PORTS=()
 if [ -s "$OPEN_PORTS_FILE" ]; then
     mapfile -t OPEN_PORTS < <(sort -n "$OPEN_PORTS_FILE")
+fi
+
+# --------- Optional Service / Version / OS Detection ----------
+if [ "$ENABLE_SERVICE_DETECT" = true ]; then
+    service_version_detection "$TARGET_IPV4"
 fi
 
 # --------- Define LDAP_DOMAIN ----------
@@ -3023,6 +3257,11 @@ fi
 
 # --------- Debug / Visibility ----------
 check_rpc_services "$TARGET_IPV4"
+
+# --------- NFS Enumeration (111/RPCBind or 2049/NFS) ----------
+if printf '%s\n' "${OPEN_PORTS[@]}" | grep -Eq '^(111|2049)$'; then
+    enumerate_nfs "$TARGET_IPV4"
+fi
 
 # --------- SMB Enumeration (only if 139 or 445 is open) ----------
 if [ -s "$SMB_MARKER" ]; then
@@ -4505,7 +4744,9 @@ generate_synopsis() {
     if [ "$WEB_DETECTED" = true ]; then
         echo -e "\n ${CYAN}WEB SERVICES${RESET}"
         echo -e " --------------------------------------"
-        print_item "$WEB_DETECTED" "Web Services Detected (Check for VHosts/Subdomains)"
+        print_item "$WEB_DETECTED" "Web Services Detected "
+        print_item "$WEB_DETECTED" "  - Check for VHosts/Subdomains [vhost_ffuf.py]"
+        print_item "$WEB_DETECTED" "  - Check for Local File Inclusion (LFI) abuse [lfi_tester.py]"
     fi
     
     # 5. Known Vulnerabilities / Misconfigurations
@@ -4693,6 +4934,30 @@ attack_path_evaluation() {
         echo "   - Review for Paths to Crown Jewels. Review for Permission Abuse."
     fi
     
+    # 9. NFS Services
+    if [[ "${NFS_FOUND:-false}" == true ]]; then
+        echo -e "\n ${CYAN}NFS SERVICES${RESET}"
+        echo -e " --------------------------------------"
+
+        print_item "$NFS_FOUND" "NFS Service Detected"
+
+        if [[ "${NFS_WORLD_EXPORT:-false}" == true ]]; then
+            print_item "$NFS_WORLD_EXPORT" "World-accessible NFS export detected"
+            print_item "$NFS_WORLD_EXPORT" "- Enumerate exports [showmount -e $TARGET_IPV4]"
+            print_item "$NFS_WORLD_EXPORT" "- Mount exports read-only and inspect numeric UID/GID ownership"
+            print_item "$NFS_WORLD_EXPORT" "   - sudo mkdir -p /mnt/nfs"
+            print_item "$NFS_WORLD_EXPORT" "   - sudo mount -t nfs -o ro $TARGET_IPV4:/EXPORT /mnt/nfs"
+            print_item "$NFS_WORLD_EXPORT" "- Check backups, home directories, SSH keys, configs, and web roots"
+
+            if [[ -n "${NFS_EXPORTS_FILE:-}" ]]; then
+                echo -e " Export results: ${YELLOW}${NFS_EXPORTS_FILE}${RESET}"
+            fi
+        else
+            print_item "$NFS_FOUND" \
+                "- Review RPC/NFS results and test exports with read-only mounts"
+        fi
+    fi
+    
     # No viable paths
     if [[ ${#ATTACK_PATHS[@]} -eq 0 ]]; then
         warn "No immediate attack paths identified"
@@ -4725,6 +4990,8 @@ if [[ $HAS_SMB -eq 1 && $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 ]]; then
     echo
 elif [[ $HAS_SMB -eq 1 ]]; then
     alert "ATTACK SURFACE: FILE SHARES / WINDOWS HOST"
+elif [[ "$NFS_FOUND" == true ]]; then
+    alert "ATTACK SURFACE: NFS / UNIX FILE SHARES"
 elif [[ $HAS_WEB -eq 1 ]]; then
     alert "ATTACK SURFACE: WEB APPLICATION"
 fi
@@ -4764,7 +5031,22 @@ cat <<EOF
   - Tools: smbclient, crackmapexec, enum4linux-ng, nxc, smbmap, responder
 EOF
         ;;
-        KERBEROS)
+        NFS)
+cat <<EOF
+[Network File Server | NFS]
+  - Likely Linux Server
+  - Prioritize backups, home directories, SSH material, configs, and web roots
+  - Mount read-only first and inspect numeric UID/GID ownership
+     - sudo mkdir -p /mnt/nfs
+     - sudo mount -t nfs -o ro <TARGET_IP>:/EXPORT /mnt/nfs
+       - ls -lan /mnt/nfs
+       - find /mnt/nfs -maxdepth 4 -ls 2>/dev/null
+       - grep -RniE 'password|secret|token|key|credential' /mnt/nfs 2>/dev/null
+     - sudo umount /mnt/nfs
+  - Tools: impacket-GetNPUsers, kerbrute, kinit, impacket
+EOF
+	;;
+	KERBEROS)
 cat <<EOF
 [Kerberos / Active Directory]
   - Likely Windows domain controller
@@ -4841,6 +5123,7 @@ cat <<EOF
   - Attempt SSH key injection
 EOF
         ;;
+
     esac
 done
 

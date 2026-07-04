@@ -1256,6 +1256,124 @@ run_impacket_dacl_audit() {
     echo
 }
 
+run_bloodyad_writable_audit() {
+    local date_tag
+    local out_dir
+    local output_file
+    local dc_host
+    local rc
+    local -a bad_cmd
+
+    if ! command -v bloodyad >/dev/null 2>&1; then
+        warn "bloodyad not found — skipping directory-wide writable-object audit"
+        lightbulb "Install with: sudo apt install bloodyad"
+        return 1
+    fi
+
+    if [[ "$LDAP_BIND_TYPE" != "auth" ]]; then
+        info "Skipping writable-object audit — authenticated LDAP required"
+        return 0
+    fi
+
+    if [[ -z "${AUTH_USER:-}" ||
+          -z "${LDAP_DOMAIN:-}" ||
+          -z "${TARGET_IPV4:-}" ]]; then
+        warn "Missing username, domain, or DC IP for writable-object audit"
+        return 1
+    fi
+
+    dc_host="$(get_preferred_dc_host "$TARGET_IPV4")"
+
+    date_tag="$(date +'%Y%m%d_%H%M%S')"
+    out_dir="bloodyad_${TARGET_IPV4}_${date_tag}"
+    output_file="${out_dir}/writable_detailed.txt"
+
+    mkdir -p "$out_dir"
+
+    #
+    # Prefer an existing Kerberos ccache.
+    #
+    if [[ -n "${KRB5CCNAME:-}" ]] && klist -s >/dev/null 2>&1; then
+        info "Using Kerberos ccache for bloodyAD"
+
+        bad_cmd=(
+            bloodyad
+            -H "$dc_host"
+            -i "$TARGET_IPV4"
+            -d "$LDAP_DOMAIN"
+            -u "$AUTH_USER"
+            -k "ccache=$KRB5CCNAME"
+        )
+    else
+        if [[ -z "${AUTH_PASS:-}" ]]; then
+            warn "No usable Kerberos ccache or password available"
+            return 1
+        fi
+
+        info "Using username/password authentication for bloodyAD"
+
+        bad_cmd=(
+            bloodyad
+            -H "$dc_host"
+            -i "$TARGET_IPV4"
+            -d "$LDAP_DOMAIN"
+            -u "$AUTH_USER"
+            -p "$AUTH_PASS"
+        )
+    fi
+
+    echo
+    info "Running directory-wide effective writable-object audit"
+    note "Deleted objects are intentionally included"
+    note "Output directory: $out_dir"
+
+    set +e
+    if [[ "$ENABLE_BH_EXPORT" == "true" ]]; then
+        "${bad_cmd[@]}" get writable \
+            --detail \
+            --bh \
+            >"$output_file" 2>&1
+    else
+        "${bad_cmd[@]}" get writable \
+            --detail \
+            >"$output_file" 2>&1
+    fi
+
+    rc=${PIPESTATUS[0]}
+    set -e
+    
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}${bad_cmd[@]} get writable --detail ${RESET}"
+    
+    if [[ $rc -ne 0 ]]; then
+        warn "bloodyad writable audit failed with exit code $rc"
+        return "$rc"
+    fi
+
+    success "Writable-object audit saved to: ${BLUE}$output_file${RESET}"
+
+    echo
+    high_risk "High-signal writable-object results:"
+
+    grep -Ei \
+        'DACL: WRITE|permission: (WRITE|CREATE_CHILD)|Deleted Objects|\\0ADEL:|MicrosoftDNS|DomainDnsZones|ForestDnsZones|svc_deploy|Remote Management|Backup|Deploy' \
+        "$output_file" \
+        | sed 's/^/  /' \
+        || info "No high-signal patterns matched the summary parser"
+
+    echo
+    info "Review all child-creation rights:"
+    echo -e "  ${GREEN}grep -B2 -A8 -Ei 'CREATE_CHILD|create.*child' '$output_file'${RESET}"
+
+    info "Review deleted-object rights:"
+    echo -e "  ${GREEN}grep -B2 -A10 -Ei 'Deleted Objects|\\\\0ADEL:' '$output_file'${RESET}"
+
+    info "Review sensitive writable attributes:"
+    echo -e "  ${GREEN}grep -B2 -A10 -Ei 'servicePrincipalName|msDS-KeyCredentialLink|member|nTSecurityDescriptor|userAccountControl|scriptPath' '$output_file'${RESET}"
+
+    return 0
+}
+
 ldap_enum() {
     local USE_AUTH="$1"
     local PASSED_DOMAIN="${2:-}"
@@ -1771,11 +1889,15 @@ ldap_enum() {
         rm -f "$KERBEROAST_OUT" 2>/dev/null
     fi
     
+    echo
     ########################################
     # 8b. Read-only DACL audit with Impacket
     ########################################
     if [[ "$LDAP_BIND_TYPE" == "auth" ]]; then
+        info "Checking Active Directory for writable objects and exploitable ACL permissions (Authenticated only)"
+        note "Impacket checks selected high-value objects; bloodyAD searches directory-wide for effective write access"
         run_impacket_dacl_audit || true
+        run_bloodyad_writable_audit || true
     fi
     
     echo

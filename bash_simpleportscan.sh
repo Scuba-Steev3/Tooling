@@ -202,6 +202,14 @@ ADCS_SERVICE_DETECTED=false
 MACHINE_ACCOUNT_QUOTA=-1
 CAN_JOIN_COMPUTERS_TO_DOMAIN=false
 HAS_WRITABLE_COMPUTER_ACL=false
+RBCD_AUDIT_DONE=false
+RBCD_PARSE_OK=false
+# Candidate ACE exists, but its trustee may not belong to the current user.
+RBCD_CANDIDATE_FOUND=false
+# Trustee matched AUTH_USER, Authenticated Users, Everyone,
+# or one of AUTH_USER_GROUP_NAMES.
+RBCD_APPLICABLE_ACL=false
+declare -a RBCD_APPLICABLE_TRUSTEES=()
 KERBEROAST_HASH_FOUND=false     # Set when Kerberoast output is non-empty
 SPN_NAME=""                     # Parse from Kerberoast result
 BH_ZIP_FILE=""
@@ -1374,6 +1382,29 @@ run_bloodyad_writable_audit() {
     return 0
 }
 
+detect_kerberos_clock_skew() {
+    local command_output="${1:-}"
+
+    if grep -qiE 'KRB_AP_ERR_SKEW|Clock skew too great' <<< "$command_output"; then
+        echo
+        warn "Kerberos authentication failed because of clock skew"
+        note "Your system time differs too much from the domain controller"
+        note "Target DC: ${TARGET_IPV4:-unknown}"
+
+        echo -e "     ${YELLOW}$ICON_TIP Synchronize your clock with the domain controller:${RESET}"
+        echo -e "        ${GREEN}sudo ntpdate -u ${TARGET_IPV4}${RESET}"
+        echo
+        echo -e "     ${YELLOW}$ICON_TIP Alternative using chrony:${RESET}"
+        echo -e "        ${GREEN}sudo chronyd -q 'server ${TARGET_IPV4} iburst'${RESET}"
+        echo
+        note "After synchronizing, rerun the authenticated LDAP checks"
+
+        return 0
+    fi
+
+    return 1
+}
+
 ldap_enum() {
     local USE_AUTH="$1"
     local PASSED_DOMAIN="${2:-}"
@@ -1906,80 +1937,246 @@ ldap_enum() {
     ########################################
     if [[ "$LDAP_BIND_TYPE" == "auth" ]]; then
         info "Checking for writable computer object ACLs (Resource-Based Constrained Delegation [RBCD] - Authenticated only)"
+        
+        DACL_OUT=""
+        DACL_RC=0
+        
+        #if [[ "$NTLM_ENABLED" == true ]]; then
+        #    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        #    echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
+	#
+        #    DACL_OUT=$(
+        #        timeout 15 $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -M daclread \
+        #        -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+        #    )
+        #else
+        #    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+        #    echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
+        #
+        #    DACL_OUT=$(
+        #       timeout 15 netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k -M daclread \
+        #        -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+        #    )
+        #fi
+        
         if [[ "$NTLM_ENABLED" == true ]]; then
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
             echo -e "        ${GREEN}$LDAP_TOOL ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
 
+            set +e
             DACL_OUT=$(
-                timeout 15 $LDAP_TOOL ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -M daclread \
-                -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+                timeout 15 "$LDAP_TOOL" ldap "$TARGET_IPV4" \
+                    "${LDAP_EXEC_ARGS[@]}" \
+                    -M daclread \
+                    -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" \
+                    ACTION=read \
+                    2>&1
             )
+            DACL_RC=$?
+            set -e
         else
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
             echo -e "        ${GREEN}netexec ldap $TARGET_IPV4 ${LDAP_EXEC_ARGS[@]} -k -M daclread -o 'TARGET_DN=CN=Computers,$LDAP_BASE_DN' ACTION=read${RESET}"
 
+            set +e
             DACL_OUT=$(
-                timeout 15 netexec ldap "$TARGET_IPV4" "${LDAP_EXEC_ARGS[@]}" -k -M daclread \
-                -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" ACTION=read 2>/dev/null
+                timeout 15 netexec ldap "$TARGET_IPV4" \
+                    "${LDAP_EXEC_ARGS[@]}" \
+                    -k \
+                    -M daclread \
+                    -o "TARGET_DN=CN=Computers,$LDAP_BASE_DN" \
+                    ACTION=read \
+                    2>&1
             )
+            DACL_RC=$?
+            set -e
         fi
+	
+	if detect_kerberos_clock_skew "$DACL_OUT"; then
+            warn "RBCD ACL result is unknown because Kerberos authentication failed"
+            RBCD_CHECK_STATUS="clock_skew"
+            HAS_WRITABLE_COMPUTER_ACL=false
+            return
+        elif [[ $DACL_RC -eq 124 ]]; then
+            warn "RBCD ACL check timed out after 15 seconds"
+            RBCD_CHECK_STATUS="timeout"
+            HAS_WRITABLE_COMPUTER_ACL=false
+            return
+        elif [[ $DACL_RC -ne 0 ]]; then
+            warn "RBCD ACL check failed with exit code $DACL_RC"
+            note "The result is unknown; no clean ACL conclusion can be made"
 
-        # Detect ACEs with Writable Permissions on Computer Objects 
-        mapfile -t RBCD_ACES < <(
-            echo "$DACL_OUT" | awk '
-                BEGIN {
-                    flag = 0;
-                    match = 0;
-                    ace_idx = "";
-                    access_mask = "";
-                    object_type = "";
-                    trustee = "";
-                }
-                /^.*ACE\[[0-9]+\]/ {
-                    ace_idx = $0;
-                    flag = 1;
-                    access_mask = "";
-                    object_type = "";
-                    trustee = "";
-                    next;
-                }
-                /^🛠.*Access:/ && flag {
-                    access_mask = $0;
-                    next;
-                }
-                /^🛠.*Object Type:.*Computer/ && flag {
-                    object_type = $0;
-                    if (access_mask ~ /WriteProperty|WriteOwner|FullControl/) {
-                        match = 1;
-                    }
-                    next;
-                }
-                /^🛠.*/ && $0 ~ /[^\s]/ && flag && match && trustee == "" {
-                    trustee = $0;
-                    print ace_idx "\n" access_mask "\n" object_type "\n" trustee;
-                    flag = 0;
-                    match = 0;
-                }
-            '
-        )
-        
-        if (( ${#RBCD_ACES[@]} > 0 )); then
-            warn "Potential RBCD (Writable Computer ACLs) Detected:"
-            echo
-    
-            for ((i=0; i<${#RBCD_ACES[@]}; i+=4)); do
-                echo -e "${YELLOW}    ${RBCD_ACES[i]}${RESET}"
-                echo -e "        ${RED}${RBCD_ACES[i+1]}${RESET}"
-                echo -e "        ${BLUE}${RBCD_ACES[i+2]}${RESET}"
-                echo -e "        ${GREEN}${RBCD_ACES[i+3]}${RESET}"
-            done
-    
-            echo
-            info "Next Step: Consider checking for Resource-Based Constrained Delegation paths using tools like:"
-            echo -e "   ${GREEN}impacket-findDelegation.py${RESET}, ${GREEN}BloodHound${RESET}, or ${GREEN}PowerView${RESET}"
+            printf '%s\n' "$DACL_OUT" |
+                tail -n 10 |
+                sed 's/^/     /'
+            RBCD_CHECK_STATUS="error"
+            HAS_WRITABLE_COMPUTER_ACL=false
+            return
         else
-            success "No writable computer ACLs found (based on known access masks)"
+            RBCD_CHECK_STATUS="success"
         fi
+	
+        # Detect ACEs with writable permissions that apply to computer objects.
+	# Capture AWK status separately so a parser failure is not reported as
+	# "No writable computer ACLs found."
+
+	RBCD_PARSE_OK=false
+	RBCD_PARSED=""
+
+	if RBCD_PARSED=$(
+	    printf '%s\n' "$DACL_OUT" |
+	    awk '
+		function reset_ace() {
+		    ace_idx = ""
+		    access_mask = ""
+		    object_type = ""
+		    inherited_type = ""
+		    trustee = ""
+		}
+
+		function emit_ace() {
+		    if (ace_idx == "" || trustee == "")
+			return
+
+		    # Keep each assignment on one line for mawk/POSIX awk compatibility.
+		    broad_write = (access_mask ~ /(FullControl|GenericAll|GenericWrite|WriteOwner|WriteDACL)/)
+		    property_write = (access_mask ~ /WritePropert(y|ies)/)
+		    computer_scope = (object_type ~ /:[[:space:]]*Computer([[:space:]]|\(|$)/ || inherited_type ~ /:[[:space:]]*Computer([[:space:]]|\(|$)/)
+		    rbcd_property = (object_type ~ /ms-DS-Allowed-To-Act-On-Behalf-Of-Other-Identity/)
+
+		    if ((computer_scope && broad_write) || (computer_scope && property_write && (object_type == "" || rbcd_property)) || (property_write && rbcd_property)) {
+			scope_line = object_type
+
+			if (!rbcd_property && inherited_type != "")
+			    scope_line = inherited_type
+
+			print ace_idx
+			print access_mask
+			print scope_line
+			print trustee
+		    }
+		}
+
+		BEGIN {
+		    reset_ace()
+		}
+
+		/ACE\[[0-9]+\][[:space:]]+info/ {
+		    emit_ace()
+		    reset_ace()
+		    ace_idx = $0
+		    next
+		}
+
+		/Access mask[[:space:]]*:/ {
+		    access_mask = $0
+		    next
+		}
+
+		/Object type \(GUID\)[[:space:]]*:/ {
+		    object_type = $0
+		    next
+		}
+
+		/Inherited type \(GUID\)[[:space:]]*:/ {
+		    inherited_type = $0
+		    next
+		}
+
+		/Trustee \(SID\)[[:space:]]*:/ {
+		    trustee = $0
+		    next
+		}
+
+		END {
+		    emit_ace()
+		}
+	    '
+	); then
+	    RBCD_PARSE_OK=true
+	fi
+
+	RBCD_ACES=()
+
+	if [[ "$RBCD_PARSE_OK" == true && -n "$RBCD_PARSED" ]]; then
+	    mapfile -t RBCD_ACES <<< "$RBCD_PARSED"
+	fi
+
+	if [[ "$RBCD_PARSE_OK" != true ]]; then
+	    warn "Failed to parse NetExec daclread output; RBCD status is unknown"
+
+	elif (( ${#RBCD_ACES[@]} > 0 )); then
+	    risk "Potential RBCD-related writable computer ACLs detected:"
+	    echo
+
+	    for ((i = 0; i < ${#RBCD_ACES[@]}; i += 4)); do
+		echo -e "${YELLOW} ${RBCD_ACES[i]}${RESET}"
+		echo -e " ${RED}${RBCD_ACES[i + 1]}${RESET}"
+		echo -e " ${BLUE}${RBCD_ACES[i + 2]}${RESET}"
+		echo -e " ${GREEN}${RBCD_ACES[i + 3]}${RESET}"
+		echo
+	    done
+
+	    HAS_WRITABLE_COMPUTER_ACL=true
+	    RBCD_CANDIDATE_FOUND=true
+	    RBCD_AUDIT_DONE=true
+
+	    info "Next Step: Validate the trustee against the authenticated user and their groups."
+	    echo -e "  ${GREEN}BloodHound, PowerView, or Impacket delegation tooling${RESET}"
+	    
+	    RBCD_APPLICABLE_ACL=false
+	    RBCD_APPLICABLE_TRUSTEES=()
+
+	    for ((i = 0; i + 3 < ${#RBCD_ACES[@]}; i += 4)); do
+	        trustee_line="${RBCD_ACES[i + 3]}"
+
+	        # Extract:
+	        #   Account Operators
+	        # from:
+	        #   Trustee (SID) : Account Operators (S-1-5-32-548)
+	        trustee_value="${trustee_line##*: }"
+	        trustee_name="${trustee_value% (*}"
+	        trustee_short="${trustee_name##*\\}"
+
+	        trustee_lc="${trustee_short,,}"
+	        auth_user_lc="${AUTH_USER,,}"
+
+	        trustee_applies=false
+
+	        # Direct user ACE.
+	        if [[ -n "$auth_user_lc" && "$trustee_lc" == "$auth_user_lc" ]]; then
+		    trustee_applies=true
+	        fi
+
+	        # Broad authenticated identities.
+	        case "$trustee_lc" in
+	    	    "authenticated users"|"everyone")
+	    	        trustee_applies=true
+	    	        ;;
+	        esac
+
+	        # Group-derived ACE.
+	        if [[ "$trustee_applies" != true ]]; then
+		    for group_name in "${AUTH_USER_GROUP_NAMES[@]}"; do
+	    	        group_short="${group_name##*\\}"
+
+		        if [[ "${group_short,,}" == "$trustee_lc" ]]; then
+		            trustee_applies=true
+		            break
+		        fi
+	    	    done
+	        fi
+
+	        if [[ "$trustee_applies" == true ]]; then
+	    	    RBCD_APPLICABLE_ACL=true
+		    RBCD_APPLICABLE_TRUSTEES+=("$trustee_value")
+	        fi
+	    done
+	else
+	    success "No RBCD-relevant writable computer ACLs found in the parsed DACL"
+	    RBCD_AUDIT_DONE=true
+	    RBCD_PARSE_OK=true
+	fi
     else
         info "Skipping RBCD check — authenticated bind required"
     fi

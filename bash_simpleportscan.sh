@@ -202,6 +202,12 @@ ADCS_SERVICE_DETECTED=false
 MACHINE_ACCOUNT_QUOTA=-1
 CAN_JOIN_COMPUTERS_TO_DOMAIN=false
 HAS_WRITABLE_COMPUTER_ACL=false
+DACL_AUDIT_DIR=""
+DACL_INTERESTING_FILE=""
+DACL_INTERESTING_COUNT=0
+BLOODYAD_AUDIT_DIR=""
+BLOODYAD_WRITABLE_FILE=""
+BLOODYAD_WRITABLE_COUNT=0
 RBCD_AUDIT_DONE=false
 RBCD_PARSE_OK=false
 # Candidate ACE exists, but its trustee may not belong to the current user.
@@ -400,6 +406,80 @@ lightbulb() { echo -e "${YELLOW}${ICON_TIP} ${RESET} $*"; }
 
 is_ipv4() {
     [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+########################################
+# Reporting / Command Artifact Helpers
+########################################
+sanitize_name() {
+    local value="${1:-target}"
+    value="${value//[^A-Za-z0-9_.-]/_}"
+    printf '%s' "${value:-target}"
+}
+
+init_artifacts() {
+    local safe_target
+    safe_target="$(sanitize_name "${TARGET_IPV4:-$TARGET}")"
+
+    ARTIFACT_ROOT="${ARTIFACT_ROOT:-recon_${safe_target}}"
+    COMMANDS_DIR="$ARTIFACT_ROOT/commands"
+    EVIDENCE_DIR="$ARTIFACT_ROOT/evidence"
+    LOOT_DIR="$ARTIFACT_ROOT/loot"
+    REPORTS_DIR="$ARTIFACT_ROOT/reports"
+
+    mkdir -p "$COMMANDS_DIR" "$EVIDENCE_DIR" "$LOOT_DIR" "$REPORTS_DIR"
+
+    REPEATABLE_COMMANDS_FILE="$COMMANDS_DIR/repeatable_commands.txt"
+    ATTACK_PATH_REPORT="$REPORTS_DIR/attack_path_engine.txt"
+    LOOT_INDEX_FILE="$LOOT_DIR/loot_index.txt"
+
+    : > "$REPEATABLE_COMMANDS_FILE"
+    : > "$ATTACK_PATH_REPORT"
+    : > "$LOOT_INDEX_FILE"
+
+    {
+        echo "# Repeatable commands for report generation"
+        echo "# Target: ${TARGET_IPV4:-$TARGET}"
+        echo "# Generated: $(date -Is)"
+        echo
+    } >> "$REPEATABLE_COMMANDS_FILE"
+
+    {
+        echo "# Attack Path Engine"
+        echo "# Target: ${TARGET_IPV4:-$TARGET}"
+        echo "# Generated: $(date -Is)"
+        echo
+    } >> "$ATTACK_PATH_REPORT"
+
+    success "Artifact directories initialized under: ${BYELLOW}$ARTIFACT_ROOT${RESET}"
+}
+
+record_loot() {
+    local kind="${1:-loot}"
+    local value="${2:-}"
+    local evidence="${3:-}"
+
+    [[ -z "$value" || -z "${LOOT_INDEX_FILE:-}" ]] && return 0
+
+    {
+        echo "[$kind] $value"
+        [[ -n "$evidence" ]] && echo "  evidence: $evidence"
+        echo
+    } >> "$LOOT_INDEX_FILE"
+}
+
+record_command() {
+    local section="${1:-General}"
+    local description="${2:-Command}"
+    local command_text="${3:-}"
+
+    [[ -z "$command_text" || -z "${REPEATABLE_COMMANDS_FILE:-}" ]] && return 0
+
+    {
+        echo "## [$section] $description"
+        echo "$command_text"
+        echo
+    } >> "$REPEATABLE_COMMANDS_FILE"
 }
 
 service_version_detection() {
@@ -1199,7 +1279,11 @@ run_impacket_dacl_audit() {
     DATE_TAG=$(date +"%Y%m%d_%H%M%S")
     OUT_DIR="dacledit_${TARGET_IPV4}_${DATE_TAG}"
     mkdir -p "$OUT_DIR"
-
+    
+    DACL_AUDIT_DIR="$OUT_DIR"
+    DACL_INTERESTING_FILE="$OUT_DIR/interesting_aces.txt"
+    : > "$DACL_INTERESTING_FILE"
+    
     PRINCIPALS+=("$AUTH_USER_DN")
     if [[ ${#AUTH_USER_GROUP_DNS[@]} -gt 0 ]]; then
         PRINCIPALS+=("${AUTH_USER_GROUP_DNS[@]}")
@@ -1248,14 +1332,23 @@ run_impacket_dacl_audit() {
 
             if echo "$cmd_out" | grep -Eiq 'GenericAll|GenericWrite|WriteDACL|WriteOwner|AllExtendedRights|WriteMembers|ResetPassword|DCSync|FullControl|WriteProperty'; then
                 high_risk "Interesting ACEs found: principal='${principal_dn}' target='${target_dn}'"
-                echo "$cmd_out" | grep -Ei 'GenericAll|GenericWrite|WriteDACL|WriteOwner|AllExtendedRights|WriteMembers|ResetPassword|DCSync|FullControl|WriteProperty' \
-                    | sed 's/^/      /'
+                echo "$cmd_out" \
+  		| grep -Ei 'GenericAll|GenericWrite|WriteDACL|WriteOwner|AllExtendedRights|WriteMembers|ResetPassword|DCSync|FullControl|WriteProperty' \
+  		| tee -a "$DACL_INTERESTING_FILE" \
+  		| sed 's/^/ /'
             else
                 info "No obvious high-value rights for principal='${principal_name}' on target='${target_name}'"
             fi
         done
     done
-
+    
+    if [[ -s "$DACL_INTERESTING_FILE" ]]; then
+  	DACL_INTERESTING_COUNT=$(sort -u "$DACL_INTERESTING_FILE" | tee "$DACL_INTERESTING_FILE.tmp" | wc -l)
+  	mv "$DACL_INTERESTING_FILE.tmp" "$DACL_INTERESTING_FILE"
+    else
+  	DACL_INTERESTING_COUNT=0
+    fi
+    
     success "DACL audit complete. Full output saved under: ${BLUE}$OUT_DIR${RESET}"
 
     echo
@@ -2250,6 +2343,8 @@ certipy_prepare_kerberos() {
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     echo -e "        ${GREEN}export KRB5CCNAME='$CERTIPY_KRB5_CCACHE'${RESET}"
     echo -e "        ${GREEN}printf '%s\\n' '<password>' | kinit '${AUTH_USER}@${realm}'${RESET}"
+    record_command "Kerberos" "ccache for Certipy" "export KRB5CCNAME='$CERTIPY_KRB5_CCACHE'"
+    record_command "Kerberos" "ccache for Certipy" "printf '%s\\n' '<password>' | kinit '${AUTH_USER}@${realm}'"
 
     if printf '%s\n' "$AUTH_PASS" | kinit "${AUTH_USER}@${realm}" >/dev/null 2>&1; then
         success "Kerberos ccache ready for Certipy: ${KRB5CCNAME}"
@@ -2321,8 +2416,10 @@ kerberos_enum_users() {
     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     if [ -z "$DOMAIN_CONTROLLER" ]; then
         echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET_IPV4 -no-pass${RESET}"
+        record_command "Kerberos" "Unauthenticated Kerberos Enumeration - Enum Users" "$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET_IPV4 -no-pass"
     else
         echo -e "        ${GREEN}$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET_IPV4 -no-pass -dc-host $DOMAIN_CONTROLLER -k${RESET}"
+        record_command "Kerberos" "Unauthenticated Kerberos Enumeration - Enum Users" "$KERB_CMD $KERB_REALM/[user] -dc-ip $TARGET_IPV4 -no-pass -dc-host $DOMAIN_CONTROLLER -k"
     fi
  
     for user in "${COMMON_USERS[@]}"; do
@@ -2360,12 +2457,14 @@ kerberos_enum_users() {
         if [ -z "$DOMAIN_CONTROLLER" ]; then
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
             echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET_IPV4 -k -debug${RESET}"
+            record_command "Kerberos" "Authenticated Kerberos Enumeration" "$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET_IPV4 -k -debug"
             OUT=$(timeout 6 "$KERB_CMD" \
                 "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
                 -dc-ip "$TARGET" -k 2>&1)
         else
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
             echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-host $DOMAIN_CONTROLLER -dc-ip $TARGET_IPV4 -k -debug${RESET}"
+            record_command "Kerberos" "Authenticated Kerberos Enumeration" "$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-host $DOMAIN_CONTROLLER -dc-ip $TARGET_IPV4 -k -debug"
             OUT=$(timeout 6 "$KERB_CMD" \
                 "$KERB_REALM/$AUTH_USER:$AUTH_PASS" \
                 -dc-host "$DOMAIN_CONTROLLER" \
@@ -2411,6 +2510,7 @@ kerberos_enum_users() {
 
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/' -dc-ip $TARGET_IPV4 -usersfile $USERS_FILE${RESET}"
+        record_command "Kerberos" "AS-REP roast validation using discovered users" "$KERB_CMD '$KERB_REALM/' -dc-ip $TARGET_IPV4 -usersfile $USERS_FILE"
 
         OUT=$(timeout 15 "$KERB_CMD" \
             "$KERB_REALM/" \
@@ -2451,6 +2551,7 @@ kerberos_enum_users() {
 
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
             echo -e "        ${GREEN}$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET_IPV4 -usersfile $USERS_FILE${RESET}"
+            record_command "Kerberos" "AS-REP roast validation with user list" "$KERB_CMD '$KERB_REALM/$AUTH_USER:$AUTH_PASS' -dc-ip $TARGET_IPV4 -usersfile $USERS_FILE"
 
             OUT=$(timeout 15 "$KERB_CMD" \
                 "'$KERB_REALM/$AUTH_USER:$AUTH_PASS'" \
@@ -3443,6 +3544,8 @@ if [ -n "$AUTH_USER" ] && [ -n "$AUTH_PASS" ]; then
 fi
 
 resolve_hostname_to_ip "$TARGET"
+init_artifacts
+record_command "Invocation" "Repeat this script run" "bash $0 ${*}"
 
 # --------- Function to Scan a Single Port ----------
 # ---------- PORT SCAN LOOP ----------
@@ -3598,6 +3701,7 @@ if [ "${#OPEN_PORTS[@]}" -gt 0 ]; then
     info "This is a simple port scan, make sure you check for all available ports!"
     echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
     echo -e "           ${GREEN}nmap -p- --min-rate=8000 $TARGET_IPV4 | grep --color=always -E 'open|filtered|closed|^|$'${RESET}"
+    record_command "Discovery" "Full TCP port sweep" "nmap -p- --min-rate=8000 $TARGET_IPV4 | grep --color=always -E 'open|filtered|closed|^|$'"
     
     echo
     info "Open ports detected: ${OPEN_PORTS[*]}"
@@ -3631,6 +3735,7 @@ if grep -qx "53" "$OPEN_PORTS_FILE" 2>/dev/null; then
 
     if [[ "$ENABLE_DNS_ENUM" == true ]]; then
         dns_enum "$TARGET_IPV4" "$DNS_DOMAIN"
+        record_command "Discovery" "DNS Enumeration" "dns_enum $TARGET_IPV4 $DNS_DOMAIN"
     else
         alert "${BLUE}Tip:${RESET} DNS Service detected"
         info "    — add ${BLUE}--dns-enum${RESET} to enable DNS deeper enum"
@@ -3655,6 +3760,7 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "21"; then
         critical "Anonymous FTP login allowed"
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "           ${GREEN}ftp anonymous@$TARGET_IPV4${RESET}"
+        record_command "FTP" "Anonymous Discovery" "ftp anonymous@$TARGET_IPV4"
         FTP_ANON_OK=true
     else
         notify "Anonymous FTP login not permitted"
@@ -3719,6 +3825,7 @@ if [ -s "$SMB_MARKER" ]; then
         
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
 	echo -e "           ${GREEN}smbclient -L '//$TARGET_IPV4' -U '$AUTH' $SMB_VER_ARG -c 'exit'${RESET}"
+	record_command "SMB" "Anonymous Discovery" "smbclient -L '//$TARGET_IPV4' -U '$AUTH' $SMB_VER_ARG -c 'exit'"
         
         # Capture smbclient output
         local OUT
@@ -3737,14 +3844,17 @@ if [ -s "$SMB_MARKER" ]; then
                 if [[ "$AUTH" == "%" ]]; then
                     #echo "Null  SMB auth"
                     echo -e "           ${GREEN}netexec smb $TARGET_IPV4 -u '' -p '' -k${RESET}"
+                    record_command "SMB" "Anonymous Discovery - Kerberos" "netexec smb $TARGET_IPV4 -u '' -p '' -k"
                     OUT=$(netexec smb "$TARGET_IPV4" -k --shares 2>&1)
                 elif [[ "$AUTH" == "guest%" ]]; then
                     #echo "Guest SMB auth" 
                     echo -e "           ${GREEN}netexec smb $TARGET_IPV4 -u 'guest' -p '' -k${RESET}"
+                    record_command "SMB" "Guest Discovery - Kerberos" "netexec smb $TARGET_IPV4 -u 'guest' -p '' -k"
                     OUT=$(netexec smb "$TARGET_IPV4" -u "guest" -p "" -k 2>&1)
                 else
                     #echo "User|Pass SMB auth"
                     echo -e "           ${GREEN}netexec smb $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS' -k ${RESET}"
+                    record_command "SMB" "Auth Discovery - Kerberos" "netexec smb $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS' -k"
                     OUT=$(netexec smb "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" -k 2>&1)
                 fi
                 
@@ -3791,6 +3901,7 @@ if [ -s "$SMB_MARKER" ]; then
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "           ${GREEN}$COPY_CMD${RESET}"
 	echo -e "           ${GREEN}$COPY_CMD -c 'prompt OFF; recurse ON; mget *'${RESET}"
+	record_command "SMB" "Discovery" "$COPY_CMD -c 'prompt OFF; recurse ON; mget *'"
         # Root listing first (most reliable)
         ROOT_LIST=$(timeout 6 smbclient "//$TARGET_IPV4/$SHARE" -U "$AUTH" \
              -c "ls" 2>/dev/null)
@@ -3923,6 +4034,7 @@ if [ -s "$SMB_MARKER" ]; then
                 notify "   Kerberos was used!"
                 echo -e "     Use 'impacket-smbclient' to view files."
                 echo -e "         ${GREEN}impacket-smbclient -k ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$SMB_USER:'$SMB_PASS'@$DOMAIN_CONTROLLER${RESET}"
+                record_command "SMB" "Auth Discovery - Kerberos" "impacket-smbclient -k ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$SMB_USER:'$SMB_PASS'@$DOMAIN_CONTROLLER"
                 echo
             else
                 warn "Authenticated but no shares are visible to this user"
@@ -4097,6 +4209,7 @@ if [ -s "$SMB_MARKER" ]; then
             lightbulb " Maybe try a Password Spary if you know a 'default' Password"
             lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
             echo -e "        crackmapexec smb ${TARGET_IPV4} -u $USERS_FILE -p 'ADefaultPassword'"
+            record_command "SMB" "Auth Discovery - Password Spary" "crackmapexec smb ${TARGET_IPV4} -u $USERS_FILE -p '--ADefaultPassword--'"
 
             # Feed recon hints
             echo "KERBEROS" >> "$HINT_FILE"
@@ -4225,6 +4338,7 @@ if [[ "$HAS_MSSQL" == "true" && "$ENABLE_BH_EXPORT" == "true" ]]; then
         echo -e "   Trying Null Session access..."
         echo -e "        ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
         echo -e "           ${GREEN}$tool mssql "$TARGET_IPV4" -u '' -p ''${RESET}"
+        record_command "MSSQL" "Discovery" "$tool mssql "$TARGET_IPV4" -u '' -p ''"
 
         MSSQL_ENUM_OUTPUT=$($tool mssql "$TARGET_IPV4" -u '' -p '' 2>&1)
         echo "$MSSQL_ENUM_OUTPUT" | tee "mssql_nullenum_${TARGET_IPV4}_${DATE_TAG}.txt"
@@ -4311,12 +4425,15 @@ if $CREDS_PROVIDED; then
            lightbulb "    ${YELLOW}Copy/Paste:${RESET}"
            echo -e "        ${GREEN}crackmapexec winrm $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
            echo -e "        ${GREEN}netexec winrm $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+           record_command "WINRM" "Discovery" "crackmapexec winrm $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'"
+           record_command "WINRM" "Discovery" "netexec winrm $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'"
        
            if crackmapexec winrm "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
                     | grep -qP 'WINRM\s+\S+\s+\d+\s+\S+\s+\[\+\]'; then
                 critical "WinRM Credential Access Confirmed!"
                 WINRM_DETECTED=true
                 echo -e "        ${GREEN}evil-winrm -i ${AUTH_DOMAIN:-$LDAP_DOMAIN} -u $AUTH_USER -p '$AUTH_PASS'${RESET}"
+                record_command "WINRM" "Discovery" "evil-winrm -i ${AUTH_DOMAIN:-$LDAP_DOMAIN} -u $AUTH_USER -p '$AUTH_PASS'"
             else
                 warn "WinRM authentication failed or not permitted"
             fi
@@ -4341,6 +4458,7 @@ if $CREDS_PROVIDED; then
             
             lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
             echo -e "        ${GREEN}impacket-wmiexec ${LDAP_DOMAIN}/${AUTH_USER}@${LDAP_DC_HOST} -dc-ip $TARGET_IPV4 -k -no-pass${RESET}"
+            record_command "WMI" "Discovery" "impacket-wmiexec ${LDAP_DOMAIN}/${AUTH_USER}@${LDAP_DC_HOST} -dc-ip $TARGET_IPV4 -k -no-pass"
 
             WMIOUT=$(timeout 10 impacket-wmiexec "${LDAP_DOMAIN}/${AUTH_USER}@${LDAP_DC_HOST}" \
                         -dc-ip "$TARGET_IPV4" -k -no-pass 2>&1)
@@ -4367,6 +4485,8 @@ if $CREDS_PROVIDED; then
         lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
             echo -e "        ${GREEN}crackmapexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
             echo -e "        ${GREEN}netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+            record_command "MSSQL" "Discovery" "crackmapexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'"
+            record_command "MSSQL" "Discovery" "netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'"
        
         if crackmapexec mssql "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
             | grep -qi success; then
@@ -4474,6 +4594,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
             if certipy_prepare_kerberos "$ADCS_DOMAIN" "$CERTIPY_TARGET"; then
                 echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
                 echo -e "        ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout -debug${RESET}"
+                record_command "ADCS" "Vulnerable Certificate Detection" "certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout -debug"
 
                 set +e
                 CERTIPY_OUTPUT=$(certipy-ad find \
@@ -4494,6 +4615,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
         else
             echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
             echo -e "        ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -p '$AUTH_PASS' -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout${RESET}"
+            record_command "ADCS" "Vulnerable Certificate Detection" "certipy-ad find -u '${ADCS_USER_UPN}' -p '$AUTH_PASS' -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout"
 
             set +e
             CERTIPY_OUTPUT=$(certipy-ad find \
@@ -4517,6 +4639,7 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
                 if certipy_prepare_kerberos "$ADCS_DOMAIN" "$CERTIPY_TARGET"; then
                     echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
                     echo -e "        ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout -debug${RESET}"
+                    record_command "ADCS" "Vulnerable Certificate Detection - kerberos" "certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -enabled -vulnerable -stdout -debug"
 
                     set +e
                     CERTIPY_OUTPUT=$(certipy-ad find \
@@ -4546,12 +4669,14 @@ if [[ "$HAS_LDAP" -eq 1 && "$HAS_KERB" -eq 1 && "$ENABLE_ADCS" == true && "$CRED
             lightbulb "Kerberos requires time sync (usually within five minutes)"
             echo -e "    ${GREEN}sudo ntpdate -u '$CERTIPY_TARGET'${RESET}"
             echo -e "    ${GREEN}while true; do sudo ntpdate -u '$CERTIPY_TARGET'; sleep 2; done${RESET}"
+            record_command "NTP" "Kerberos clock skew detected" "while true; do sudo ntpdate -u '$CERTIPY_TARGET'; sleep 2; done"
         fi
 
         if echo "$CERTIPY_OUTPUT" | grep -qiE 'KDC_ERR_S_PRINCIPAL_UNKNOWN|Server not found in Kerberos database'; then
             error "Kerberos SPN/target mismatch during AD CS enumeration"
             lightbulb "Use the DC FQDN with Certipy Kerberos, not only the IP"
             echo -e "    ${GREEN}certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -vulnerable -stdout -debug${RESET}"
+            record_command "ADCS - Vulnerable Certificate Detection" "DC FQDN with Certipy Kerberos" "certipy-ad find -u '${ADCS_USER_UPN}' -k -no-pass -target '${CERTIPY_TARGET}' -dc-ip '${TARGET_IPV4}' -vulnerable -stdout -debug"
         fi
 
         if echo "$CERTIPY_OUTPUT" | grep -qiE 'KRB5CCNAME environment variable not set|CCache file is not found|No Kerberos credentials available'; then
@@ -5036,6 +5161,10 @@ generate_synopsis() {
     if [ -n "$AUTH_DOMAIN" ] ; then
         echo -e "   - Domain:    ${YELLOW}$AUTH_DOMAIN${RESET}"
     fi
+    
+    success "Repeatable command artifact saved to: ${BYELLOW}$REPEATABLE_COMMANDS_FILE${RESET}"
+    success "Attack path artifact saved to: ${BYELLOW}$ATTACK_PATH_REPORT${RESET}"
+    success "Loot index saved to: ${BYELLOW}$LOOT_INDEX_FILE${RESET}"
     
     local found_any=false
 

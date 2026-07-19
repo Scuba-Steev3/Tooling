@@ -38,6 +38,7 @@ PORTS=(
     "8080:HTTP-Alt"
     "8443:HTTPS-Alt"
     "9090:Prometheus / Web"
+    "9100:printer"
     "27017:MongoDB"
 )
 

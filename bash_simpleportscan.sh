@@ -262,6 +262,8 @@ KERBEROAST_USER=""
 declare -a KERBEROAST_TARGETS=()
 declare -a SPN_LIST=()
 declare -a SPN_USER_LIST=()
+SPN_QUERY_EVIDENCE=""
+declare -a SPN_ACCOUNT_MAPPINGS=()
 BH_ZIP_FILE=""
 ENABLE_DNS_ENUM=false
 DNS_BRUTE=false
@@ -1551,6 +1553,264 @@ detect_kerberos_clock_skew() {
     return 1
 }
 
+parse_nxc_spn_query_output() {
+    local query_output="${1:-}"
+
+    [[ -n "$query_output" ]] || return 1
+
+    # NetExec prints a record header, named attributes, and then any remaining
+    # values from a multi-valued attribute on indented continuation lines.
+    # Associate every servicePrincipalName with the sAMAccountName from the
+    # same LDAP object and emit a stable account|SPN representation.
+    printf '%s\n' "$query_output" |
+        sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
+        awk '
+            function reset_record(i) {
+                user=""
+                spn_count=0
+                current_attribute=""
+                for (i in spns) delete spns[i]
+            }
+
+            function flush_record(i) {
+                if (user != "") {
+                    for (i=1; i<=spn_count; i++) {
+                        if (spns[i] ~ /^[^[:space:]\/]+\/[^[:space:]]+$/) {
+                            print user "|" spns[i]
+                        }
+                    }
+                }
+                reset_record()
+            }
+
+            BEGIN {
+                reset_record()
+            }
+
+            /Response for object:/ {
+                flush_record()
+                next
+            }
+
+            {
+                line=$0
+                sub(/^[[:space:]]*LDAP[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+
+                if (line ~ /^sAMAccountName[[:space:]]+/) {
+                    sub(/^sAMAccountName[[:space:]]+/, "", line)
+                    user=line
+                    current_attribute=""
+                    next
+                }
+
+                if (line ~ /^servicePrincipalName[[:space:]]+/) {
+                    sub(/^servicePrincipalName[[:space:]]+/, "", line)
+                    if (line != "") spns[++spn_count]=line
+                    current_attribute="servicePrincipalName"
+                    next
+                }
+
+                if (current_attribute == "servicePrincipalName" &&
+                    line ~ /^[^[:space:]\/]+\/[^[:space:]]+$/) {
+                    spns[++spn_count]=line
+                    next
+                }
+
+                if (line != "") current_attribute=""
+            }
+
+            END {
+                flush_record()
+            }
+        ' |
+        sort -t'|' -k1,1f -k2,2f -u
+}
+
+gather_spn_accounts() {
+    local requested_mode="${1:-auto}"
+    local auth_mode=""
+    local tool=""
+    local domain="${LDAP_DOMAIN:-${AUTH_DOMAIN:-}}"
+    local query_target="${TARGET_IPV4:-${TARGET:-$domain}}"
+    local ldap_filter='(&(objectCategory=person)(objectClass=user)(servicePrincipalName=*))'
+    local ldap_attributes='sAMAccountName servicePrincipalName'
+    local output=""
+    local clean_output=""
+    local records=""
+    local repeatable=""
+    local safe_target=""
+    local preferred_spn=""
+    local mapping=""
+    local account=""
+    local spn=""
+    local rc=0
+    local errexit_was_set=false
+    local -a cmd=()
+
+    SPN_QUERY_EVIDENCE=""
+    SPN_ACCOUNT_MAPPINGS=()
+
+    if [[ -z "${AUTH_USER:-}" || -z "${AUTH_PASS:-}" ]]; then
+        warn "SPN enumeration requires authenticated LDAP credentials"
+        return 1
+    fi
+
+    if [[ -z "$domain" ]]; then
+        warn "Domain is unknown — skipping SPN enumeration"
+        return 1
+    fi
+
+    if command -v nxc >/dev/null 2>&1; then
+        tool="nxc"
+    elif command -v netexec >/dev/null 2>&1; then
+        tool="netexec"
+    else
+        warn "NetExec was not found — skipping SPN enumeration"
+        lightbulb "Install with: pipx install netexec"
+        return 1
+    fi
+
+    case "${requested_mode,,}" in
+        auto)
+            if [[ "${NTLM_ENABLED:-false}" == true ]]; then
+                auth_mode="ntlm"
+            else
+                auth_mode="kerberos"
+            fi
+            ;;
+        kerberos|krb5)
+            auth_mode="kerberos"
+            ;;
+        ntlm|password)
+            auth_mode="ntlm"
+            ;;
+        *)
+            warn "Unsupported SPN query authentication mode: $requested_mode"
+            return 1
+            ;;
+    esac
+
+    if [[ "$auth_mode" == kerberos ]]; then
+        query_target="$(get_preferred_dc_host "$query_target")"
+    fi
+
+    cmd=(
+        "$tool" ldap "$query_target"
+        -d "$domain"
+        -u "$AUTH_USER"
+        -p "$AUTH_PASS"
+    )
+    [[ "$auth_mode" == kerberos ]] && cmd+=( -k )
+    cmd+=( --query "$ldap_filter" "$ldap_attributes" )
+
+    repeatable="$tool ldap '$query_target' -d '$domain' -u \"\$AUTH_USER\" -p \"\$AUTH_PASS\""
+    [[ "$auth_mode" == kerberos ]] && repeatable+=" -k"
+    repeatable+=" --query '$ldap_filter' '$ldap_attributes'"
+
+    echo
+    info "Gathering SPN-bearing user accounts via NetExec LDAP ($auth_mode)"
+    echo -e "     ${YELLOW}$ICON_TIP Copy/Paste:${RESET}"
+    echo -e "        ${GREEN}${repeatable}${RESET}"
+
+    if declare -F record_command >/dev/null 2>&1; then
+        record_command "LDAP" "SPN-bearing user account query ($auth_mode)" "$repeatable"
+    fi
+
+    [[ $- == *e* ]] && errexit_was_set=true
+    set +e
+    output=$("${cmd[@]}" 2>&1)
+    rc=$?
+    if [[ "$errexit_was_set" == true ]]; then
+        set -e
+    fi
+
+    clean_output=$(
+        printf '%s\n' "$output" |
+            sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g'
+    )
+
+    if (( rc != 0 )); then
+        if [[ "$auth_mode" == kerberos ]] &&
+           declare -F detect_kerberos_clock_skew >/dev/null 2>&1 &&
+           detect_kerberos_clock_skew "$clean_output"; then
+            :
+        elif grep -qiE \
+            'STATUS_LOGON_FAILURE|KDC_ERR|LDAPSessionError|invalid credentials|authentication failed' \
+            <<< "$clean_output"; then
+            warn "LDAP authentication failed during SPN enumeration"
+        else
+            warn "SPN enumeration failed with exit code $rc"
+        fi
+        return "$rc"
+    fi
+
+    records=$(parse_nxc_spn_query_output "$clean_output" || true)
+    if [[ -z "$records" ]]; then
+        warn "No SPN-bearing user accounts were returned"
+        return 1
+    fi
+
+    mapfile -t SPN_ACCOUNT_MAPPINGS < <(printf '%s\n' "$records")
+    mapfile -t SPN_USER_LIST < <(
+        printf '%s\n' "$records" | cut -d'|' -f1 | sort -fu
+    )
+    mapfile -t SPN_LIST < <(
+        printf '%s\n' "$records" | cut -d'|' -f2- | sort -fu
+    )
+    KERBEROAST_TARGETS=("${SPN_LIST[@]}")
+
+    if [[ -n "${KERBEROAST_USER:-}" ]]; then
+        preferred_spn=$(
+            printf '%s\n' "$records" |
+                awk -F'|' -v user="$KERBEROAST_USER" '
+                    tolower($1) == tolower(user) {
+                        print ($2 ~ /:[0-9]+$/ ? 1 : 0) "|" $2
+                    }
+                ' |
+                sort -t'|' -k1,1n -k2,2f |
+                cut -d'|' -f2- |
+                head -n 1
+        )
+
+        if [[ -n "$preferred_spn" ]]; then
+            SPN_NAME="$preferred_spn"
+        else
+            SPN_NAME=""
+            warn "No LDAP SPN mapping matched Kerberoast account $KERBEROAST_USER"
+        fi
+    else
+        IFS='|' read -r KERBEROAST_USER SPN_NAME <<< "${SPN_ACCOUNT_MAPPINGS[0]}"
+    fi
+
+    safe_target="$(sanitize_name "${TARGET_IPV4:-${TARGET:-$domain}}")"
+    SPN_QUERY_EVIDENCE="${EVIDENCE_DIR:-.}/spn_accounts_${safe_target}_$(date +%Y%m%d_%H%M%S).txt"
+    mkdir -p "$(dirname "$SPN_QUERY_EVIDENCE")"
+    {
+        echo "collected_at=$(date -Is)"
+        echo "domain=$domain"
+        echo "query_target=$query_target"
+        echo "authentication=$auth_mode"
+        echo "source=$tool ldap --query"
+        echo "account|service_principal_name"
+        printf '%s\n' "${SPN_ACCOUNT_MAPPINGS[@]}"
+    } > "$SPN_QUERY_EVIDENCE"
+
+    for mapping in "${SPN_ACCOUNT_MAPPINGS[@]}"; do
+        IFS='|' read -r account spn <<< "$mapping"
+        record_loot "spn_account" "${domain}\\${account} ${spn}" "$SPN_QUERY_EVIDENCE"
+    done
+
+    success "Identified ${#SPN_USER_LIST[@]} SPN-bearing user account(s) and ${#SPN_LIST[@]} unique SPN(s)"
+    for mapping in "${SPN_ACCOUNT_MAPPINGS[@]}"; do
+        IFS='|' read -r account spn <<< "$mapping"
+        echo "      - ${account} -> ${spn}"
+    done
+    success "Parsed SPN evidence saved to: ${BYELLOW}$SPN_QUERY_EVIDENCE${RESET}"
+    success "Parsed SPNs recorded in: ${BYELLOW}${LOOT_INDEX_FILE:-loot index}${RESET}"
+    return 0
+}
+
 parse_getuserspns_output() {
     local enumeration_output="${1:-}"
     local preferred_spn=""
@@ -1604,10 +1864,10 @@ parse_kerberoast_metadata() {
     [[ -n "$hash_file" && -s "$hash_file" ]] || return 1
     grep -Fq "\$krb5tgs\$" "$hash_file" || return 1
 
-    # Impacket stores both RC4 and AES hashes as dollar-delimited fields. The
-    # username is field 4 and the SPN is field 6; depending on the encryption
-    # type, either value can be wrapped in asterisks. Impacket also replaces
-    # colons in SPNs with tildes for hashcat compatibility.
+    # The hash identifies the roastable account, but its sixth field is only a
+    # hash label/salt. Some tools put DOMAIN/user or DOMAIN\user there instead
+    # of the account's real servicePrincipalName. Authoritative SPNs must come
+    # from the GetUserSPNs enumeration table.
     KERBEROAST_USER=$(awk -F'$' '
         $2 == "krb5tgs" {
             value=$4
@@ -1617,16 +1877,16 @@ parse_kerberoast_metadata() {
         }
     ' "$hash_file")
 
-    SPN_NAME=$(awk -F'$' '
-        $2 == "krb5tgs" {
-            value=$6
-            sub(/^\*/, "", value)
-            sub(/\*$/, "", value)
-            gsub(/~/, ":", value)
-            print value
-            exit
-        }
-    ' "$hash_file")
+    #SPN_NAME=$(awk -F'$' '
+    #    $2 == "krb5tgs" {
+    #        value=$6
+    #        sub(/^\*/, "", value)
+    #        sub(/\*$/, "", value)
+    #        gsub(/~/, ":", value)
+    #        print value
+    #        exit
+    #    }
+    #' "$hash_file")
 
     mapfile -t KERBEROAST_TARGETS < <(
         awk -F'$' '
@@ -5485,6 +5745,12 @@ if [ -s "$LDAP_MARKER" ] && ! $LDAP_ENUM_DONE; then
     if $LDAP_ANON_BIND; then
         high_risk "LDAP Exposure Level: Anonymous Directory Access"
     fi
+fi
+if $CREDS_PROVIDED && (( HAS_LDAP == 1 )); then
+    # Gather authoritative account-to-SPN mappings through an LDAP query.
+    # Auto mode follows the existing NTLM capability result and uses Kerberos
+    # when password/NTLM LDAP authentication is unavailable.
+    gather_spn_accounts auto || true
 fi
 if $LDAP_AUTH_BIND; then
     #Get Domain/AD Version
